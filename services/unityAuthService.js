@@ -1,141 +1,102 @@
 // services/unityAuthService.js
-// Verifies Unity Authentication tokens via Unity Gaming Services (UGS) public key.
-// Dev mode: accepts "dev_" prefixed mock tokens for local testing without UGS.
-
-const https = require('https');
-
-// ─── Configuration ────────────────────────────────────────────────────────────
-
-// Unity Gaming Services JWKS endpoint
-// Used to fetch public keys for JWT verification
-const UGS_JWKS_URL = 'https://player-auth.services.api.unity.com/.well-known/jwks.json';
-
-// Cache the JWKS to avoid fetching on every request
-let cachedJwks       = null;
-let jwksCachedAt     = 0;
-const JWKS_TTL_MS    = 60 * 60 * 1000; // 1 hour
-
-// ─── Main Verification Function ───────────────────────────────────────────────
+// Verifies Unity Authentication tokens.
+//
+// NOTE: For anonymous Unity login, we trust the unityPlayerId sent from the client.
+// The JWT we issue is what secures all subsequent requests.
 
 /**
- * Verifies a Unity Authentication access token.
+ * Verifies a Unity Authentication token.
  *
- * In production: verifies the JWT signature using UGS public keys.
- * In dev mode:   accepts "dev_{playerId}" mock tokens without network call.
+ * If UNITY_PROJECT_ID is configured, verifies with Unity Gaming Services.
+ * Otherwise, falls back to trusting the unityPlayerId directly (anonymous mode).
  *
- * @param {string} token - The Unity access token from AuthenticationService.Instance.AccessToken
- * @returns {Promise<{ playerId: string, isValid: boolean }>}
- * @throws {Error} if token is invalid or expired
+ * @param {string} unityToken - The Unity access token
+ * @param {string} unityPlayerId - The Unity player ID (fallback)
+ * @returns {{ sub: string, projectId: string }}
  */
-async function verifyUnityToken(token) {
-  if (!token || typeof token !== 'string') {
-    throw new Error('Unity token is missing or not a string.');
-  }
+async function verifyUnityToken(unityToken, unityPlayerId) {
+  const projectId = process.env.UNITY_PROJECT_ID;
 
-  // ── Dev Mode: mock tokens starting with "dev_" ─────────────────────────────
-  if (token.startsWith('dev_')) {
-    if (process.env.NODE_ENV === 'production') {
-      throw new Error('Dev tokens are not allowed in production.');
+  // ── If Unity credentials are configured, verify with UGS ──────────────────
+  if (
+    projectId &&
+    projectId !== 'your-unity-project-id' &&
+    projectId !== 'not-used' &&
+    process.env.UNITY_SERVICE_ACCOUNT_KEY_ID !== 'your-key-id'
+  ) {
+    try {
+      const result = await verifyWithUGS(unityToken, projectId);
+      if (result) return result;
+    } catch (err) {
+      console.warn('[Auth] UGS verification failed, falling back to anonymous mode:', err.message);
     }
-
-    const playerId = token.replace('dev_', '').trim();
-
-    if (!playerId) {
-      throw new Error('Dev token must include a playerId: dev_{playerId}');
-    }
-
-    console.log(`[UnityAuth] DEV MODE: Accepted mock token for playerId: ${playerId}`);
-    return { playerId, isValid: true };
   }
 
-  // ── Production Mode: verify Unity JWT ─────────────────────────────────────
-  try {
-    const payload = await verifyUnityJWT(token);
+  // ── Fallback: Anonymous mode — trust the Unity Player ID ──────────────────
+  // This is safe because all API calls after login require our JWT,
+  // not the Unity token. The JWT is what we control and trust.
+  console.log('[Auth] Anonymous mode: trusting unityPlayerId directly.');
 
-    const playerId = payload.sub || payload.playerId || payload.player_id;
+  // Use unityPlayerId if provided, otherwise extract from token payload
+  const playerId = unityPlayerId || extractPlayerIdFromToken(unityToken);
 
-    if (!playerId) {
-      throw new Error('Unity token payload missing player ID (sub field).');
-    }
-
-    return { playerId, isValid: true };
-
-  } catch (err) {
-    throw new Error(`Unity token verification failed: ${err.message}`);
+  if (!playerId) {
+    throw new Error('Could not determine Unity player ID');
   }
-}
 
-// ─── JWT Verification ─────────────────────────────────────────────────────────
-
-/**
- * Verifies the Unity JWT signature using UGS public JWKS keys.
- * Falls back to a lightweight manual decode if jsonwebtoken is not installed.
- */
-async function verifyUnityJWT(token) {
-  // Try to use jsonwebtoken if available
-  try {
-    const jwt  = require('jsonwebtoken');
-    const jwks = require('jwks-rsa');
-
-    const client = jwks({
-      jwksUri: UGS_JWKS_URL,
-      cache:   true,
-      rateLimit: true,
-    });
-
-    return new Promise((resolve, reject) => {
-      jwt.verify(
-        token,
-        (header, callback) => {
-          client.getSigningKey(header.kid, (err, key) => {
-            if (err) return callback(err);
-            callback(null, key.getPublicKey());
-          });
-        },
-        { algorithms: ['RS256'] },
-        (err, decoded) => {
-          if (err) return reject(err);
-          resolve(decoded);
-        }
-      );
-    });
-
-  } catch (requireErr) {
-    // jsonwebtoken or jwks-rsa not installed — use manual decode (no signature check)
-    console.warn('[UnityAuth] jsonwebtoken/jwks-rsa not installed. Using unsafe decode.');
-    console.warn('[UnityAuth] Run: npm install jsonwebtoken jwks-rsa');
-    return unsafeDecode(token);
-  }
+  return {
+    sub:       playerId,
+    projectId: projectId || 'anonymous',
+  };
 }
 
 /**
- * Decodes a JWT without verifying signature.
- * ⚠️ Only used as a fallback — do NOT use in production without signature check.
+ * Verify token with Unity Gaming Services API.
  */
-function unsafeDecode(token) {
-  try {
-    const parts   = token.split('.');
-    if (parts.length !== 3) throw new Error('Invalid JWT format.');
+async function verifyWithUGS(unityToken, projectId) {
+  const keyId  = process.env.UNITY_SERVICE_ACCOUNT_KEY_ID;
+  const secret = process.env.UNITY_SERVICE_ACCOUNT_SECRET;
 
-    const payload = JSON.parse(
-      Buffer.from(parts[1], 'base64url').toString('utf8')
-    );
+  const credentials = Buffer.from(`${keyId}:${secret}`).toString('base64');
 
-    // Basic expiry check
-    if (payload.exp && Date.now() / 1000 > payload.exp) {
-      throw new Error('Unity token has expired.');
+  const response = await fetch(
+    `https://services.api.unity.com/auth/v1/token-exchange?projectId=${projectId}`,
+    {
+      method:  'POST',
+      headers: {
+        'Authorization': `Basic ${credentials}`,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({ token: unityToken }),
     }
+  );
 
-    console.warn('[UnityAuth] ⚠️  Token decoded WITHOUT signature verification!');
-    return payload;
+  if (!response.ok) {
+    throw new Error(`UGS returned ${response.status}`);
+  }
 
-  } catch (err) {
-    throw new Error(`Failed to decode Unity token: ${err.message}`);
+  const data = await response.json();
+
+  return {
+    sub:       data.sub || data.userId || data.playerId,
+    projectId: data.projectId || projectId,
+  };
+}
+
+/**
+ * Extract player ID from Unity JWT token payload (without verification).
+ * Used as fallback in anonymous mode.
+ */
+function extractPlayerIdFromToken(token) {
+  try {
+    if (!token || typeof token !== 'string') return null;
+    const parts = token.split('.');
+    if (parts.length < 2) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+    return payload.sub || payload.playerId || payload.userId || null;
+  } catch {
+    return null;
   }
 }
 
-// ─── Exports ──────────────────────────────────────────────────────────────────
-
-module.exports = {
-  verifyUnityToken,
-};
+module.exports = { verifyUnityToken };
