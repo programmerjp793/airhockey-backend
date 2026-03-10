@@ -22,9 +22,7 @@ const PORT = process.env.PORT || 3000;
 // ─── Security Middleware ─────────────────────────────────────────────────────
 app.use(helmet());
 app.use(cors({
-  origin: process.env.NODE_ENV === "production"
-    ? ["https://yourgame.com"]
-    : "*",
+  origin: "*",   // Unity mobile apps don't use browser origins
   methods: ["GET", "POST", "PUT"],
 }));
 app.use(morgan("dev"));
