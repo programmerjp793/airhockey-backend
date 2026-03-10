@@ -97,7 +97,7 @@ router.post(
         clientKey,
         amount:          pricePhp,
         currency:        "PHP",
-        checkoutUrl:     `https://checkout.paymongo.com/payment_intents/${intent.id}?client_key=${clientKey}`,
+        checkoutUrl: `https://checkout.paymongo.com/${clientKey}`,
       });
 
     } catch (err) {
