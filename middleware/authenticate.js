@@ -1,19 +1,9 @@
 // middleware/authenticate.js
-// JWT Bearer token verification middleware.
-// Attaches req.player = { id, unityPlayerId, username } on success.
-// Usage: router.get('/protected', authenticate, handler)
-
 const jwt    = require('jsonwebtoken');
 const Player = require('../models/Player');
 
-/**
- * Verifies the Authorization: Bearer <token> header.
- * On success: attaches req.player and calls next().
- * On failure: returns 401.
- */
 async function authenticate(req, res, next) {
   try {
-    // ── Extract token from header ────────────────────────────────────────────
     const authHeader = req.headers['authorization'] || req.headers['Authorization'];
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -29,7 +19,6 @@ async function authenticate(req, res, next) {
       return res.status(401).json({ success: false, message: 'Token is empty.' });
     }
 
-    // ── Verify JWT ──────────────────────────────────────────────────────────
     let decoded;
     try {
       decoded = jwt.verify(token, process.env.JWT_SECRET);
@@ -43,9 +32,11 @@ async function authenticate(req, res, next) {
       throw jwtErr;
     }
 
-    // ── Load player from DB ─────────────────────────────────────────────────
-    const player = await Player.findById(decoded.id).select(
-      '_id unityPlayerId username walletAddress isBanned lastSeenAt'
+    // ── Support both old (decoded.id) and new (decoded.playerId) JWT formats ─
+    const playerId = decoded.playerId || decoded.id;
+
+    const player = await Player.findById(playerId).select(
+      '_id unityPlayerId username walletAddress isBanned lastSeenAt rewardsClaimedToday rewardResetDate stats'
     );
 
     if (!player) {
@@ -56,15 +47,17 @@ async function authenticate(req, res, next) {
       return res.status(403).json({ success: false, message: 'Account is banned.' });
     }
 
-    // ── Update last seen (non-blocking) ─────────────────────────────────────
     Player.findByIdAndUpdate(player._id, { lastSeenAt: new Date() }).exec();
 
-    // ── Attach to request ────────────────────────────────────────────────────
     req.player = {
-      id:            player._id.toString(),
-      unityPlayerId: player.unityPlayerId,
-      username:      player.username,
-      walletAddress: player.walletAddress,
+      id:                   player._id.toString(),
+      _id:                  player._id,
+      unityPlayerId:        player.unityPlayerId,
+      username:             player.username,
+      walletAddress:        player.walletAddress,
+      rewardsClaimedToday:  player.rewardsClaimedToday,
+      rewardResetDate:      player.rewardResetDate,
+      stats:                player.stats,
     };
 
     next();
