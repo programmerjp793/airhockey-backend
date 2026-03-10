@@ -7,6 +7,7 @@ const mongoose = require('mongoose');
 const PlayerStatsSchema = new mongoose.Schema({
   wins:           { type: Number, default: 0 },
   losses:         { type: Number, default: 0 },
+  ties:           { type: Number, default: 0 },   // ← ADDED
   totalMatches:   { type: Number, default: 0 },
   rewardsEarned:  { type: String, default: '0' },  // TTK amount as string (BigInt-safe)
 }, { _id: false });
@@ -17,20 +18,20 @@ const PlayerSchema = new mongoose.Schema({
   unityPlayerId: {
     type:     String,
     required: true,
-    unique:   true,        // ← removed index:true (schema.index() below handles it)
+    unique:   true,
   },
 
   username: {
-    type:    String,
-    default: '',
-    trim:    true,
+    type:      String,
+    default:   '',
+    trim:      true,
     maxlength: 32,
   },
 
   email: {
-    type:    String,
-    default: '',
-    trim:    true,
+    type:      String,
+    default:   '',
+    trim:      true,
     lowercase: true,
   },
 
@@ -40,7 +41,7 @@ const PlayerSchema = new mongoose.Schema({
     default:   null,
     lowercase: true,
     trim:      true,
-    sparse:    true,       // ← removed index:true (schema.index() below handles it)
+    sparse:    true,
   },
 
   walletLinkedAt: {
@@ -111,8 +112,8 @@ PlayerSchema.index({ walletAddress: 1 }, { sparse: true });
 PlayerSchema.methods.resetDailyRewardsIfNeeded = function () {
   const now       = new Date();
   const resetDate = new Date(this.rewardResetDate);
-  const nowDay   = now.toISOString().slice(0, 10);
-  const resetDay = resetDate.toISOString().slice(0, 10);
+  const nowDay    = now.toISOString().slice(0, 10);
+  const resetDay  = resetDate.toISOString().slice(0, 10);
   if (nowDay !== resetDay) {
     this.rewardsClaimedToday = 0;
     this.rewardResetDate     = now;

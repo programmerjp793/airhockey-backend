@@ -63,12 +63,18 @@ function getSmartStoreContract() {
 
 /**
  * Get TTK token balance for a wallet address.
- * @returns BigInt (wei)
+ * Returns structured object consumed by routes/wallet.js and routes/store.js.
+ * @returns { raw: string, formatted: string, symbol: string }
  */
 async function getTokenBalance(walletAddress) {
   const token   = getTokenContract();
   const balance = await token.balanceOf(walletAddress);
-  return balance;
+
+  return {
+    raw:       balance.toString(),                                    // ← wei as string (BigInt-safe)
+    formatted: parseFloat(ethers.formatEther(balance)).toFixed(2),   // ← e.g. "12.50"
+    symbol:    'TTK',
+  };
 }
 
 /**
@@ -130,18 +136,18 @@ async function grantStoreItemAfterFiat(playerWallet, itemId, paymentIntentId) {
  * @returns Array of item objects
  */
 async function getStoreItems() {
-  const store = getSmartStoreContract();
+  const store    = getSmartStoreContract();
   const rawItems = await store.getAllItems();
 
   return rawItems
     .filter((item) => item.active)
     .map((item) => ({
-      itemId:           item.itemId,
-      name:             item.name,
-      itemType:         item.itemType,
-      priceInTTK:       item.priceInTTK.toString(),
+      itemId:              item.itemId,
+      name:                item.name,
+      itemType:            item.itemType,
+      priceInTTK:          item.priceInTTK.toString(),
       priceInTTKFormatted: parseFloat(ethers.formatEther(item.priceInTTK)).toFixed(2),
-      active:           item.active,
+      active:              item.active,
     }));
 }
 

@@ -7,9 +7,9 @@ const mongoose = require('mongoose');
 // ─── AI Profile Sub-Schema ────────────────────────────────────────────────────
 const AIProfileSchema = new mongoose.Schema({
   difficulty:    { type: String, enum: ['easy', 'medium', 'hard', 'expert'], default: 'medium' },
-  reactionSpeed: { type: Number, min: 0, max: 1, default: 0.5 },
-  errorMargin:   { type: Number, min: 0, max: 1, default: 0.3 },
-  strategy:      { type: String, enum: ['aggressive', 'defensive', 'balanced', 'adaptive'], default: 'balanced' },
+  reactionSpeed: { type: Number, min: 0, max: 1,   default: 0.5 },
+  errorMargin:   { type: Number, min: 0, max: 100, default: 0.3 }, // ← max raised: /save sends 15, 25 etc.
+  strategy:      { type: String, enum: ['aggressive', 'defensive', 'balanced', 'adaptive', 'expert_adaptive'], default: 'balanced' }, // ← added expert_adaptive
   profileHash:   { type: String, default: '' },
 }, { _id: false });
 
@@ -27,18 +27,18 @@ const MatchSchema = new mongoose.Schema({
   matchId: {
     type:     String,
     required: true,
-    unique:   true,        // ← removed index:true (schema.index() below handles it)
+    unique:   true,
   },
 
   playerId: {
     type:  mongoose.Schema.Types.ObjectId,
     ref:   'Player',
-    index: true,           // ← kept — this one is NOT duplicated below
+    index: true,
   },
 
   unityPlayerId: {
     type:  String,
-    index: true,           // ← kept — this one is NOT duplicated below
+    index: true,
   },
 
   // ─── AI Profile ─────────────────────────────────────────────────────────────
@@ -50,30 +50,33 @@ const MatchSchema = new mongoose.Schema({
   // ─── Match Token ────────────────────────────────────────────────────────────
   matchToken: {
     type:     String,
-    required: true,
+    required: false, // ← CHANGED: /save flow doesn't generate a token
+    default:  null,
   },
 
   // ─── Status ─────────────────────────────────────────────────────────────────
   status: {
     type:    String,
-    enum:    ['pending', 'active', 'submitted', 'validated', 'rewarded', 'failed', 'suspicious'],
+    enum:    ['pending', 'active', 'in_progress', 'submitted', 'validated', 'completed', 'rewarded', 'failed', 'suspicious'], // ← added in_progress, completed
     default: 'pending',
-    index:   true,         // ← kept — this one is NOT duplicated below
+    index:   true,
   },
 
   // ─── Scores ─────────────────────────────────────────────────────────────────
-  playerScore: { type: Number, default: 0 },
-  aiScore:     { type: Number, default: 0 },
+  playerScore:  { type: Number, default: 0 },
+  aiScore:      { type: Number, default: 0 },
+  opponentScore: { type: Number, default: 0 }, // ← ADDED: /save sends opponentScore
 
   winner: {
-    type: String,
-    enum: ['player', 'ai', null],
+    type:    String,
+    enum:    ['player', 'ai', 'opponent', 'tie', null], // ← added opponent, tie
     default: null,
   },
 
   // ─── Validation ─────────────────────────────────────────────────────────────
   validationPassed:     { type: Boolean, default: false },
   submittedProfileHash: { type: String,  default: '' },
+  clientReportedHash:   { type: String,  default: '' }, // ← ADDED: set in /submit-result
 
   // ─── Anti-Cheat Flags ────────────────────────────────────────────────────────
   suspicionFlags: {
@@ -83,7 +86,7 @@ const MatchSchema = new mongoose.Schema({
 
   isFlagged: {
     type:    Boolean,
-    default: false,        // ← removed index:true (schema.index() below handles it)
+    default: false,
   },
 
   // ─── Blockchain / Reward ─────────────────────────────────────────────────────
@@ -95,9 +98,11 @@ const MatchSchema = new mongoose.Schema({
   startedAt:          { type: Date,   default: () => new Date() },
   submittedAt:        { type: Date,   default: null },
   completedAt:        { type: Date,   default: null },
+  durationSecs:       { type: Number, default: 0 },   // ← ADDED: set by both /save and /submit-result
   maxDurationSeconds: { type: Number, default: 600 },
 
   // ─── Metadata ────────────────────────────────────────────────────────────────
+  walletAddress: { type: String, default: null },      // ← ADDED: stored by /save
   difficulty: {
     type:    String,
     default: 'medium',

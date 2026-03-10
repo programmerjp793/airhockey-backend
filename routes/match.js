@@ -7,8 +7,8 @@ const jwt     = require("jsonwebtoken");
 const { body, validationResult } = require("express-validator");
 const { v4: uuidv4 } = require("uuid");
 
-const { Match }   = require("../models/Match");
-const Player      = require("../models/Player");
+const { Match }    = require("../models/Match");
+const Player       = require("../models/Player");
 const authenticate = require("../middleware/authenticate");
 
 const router = express.Router();
@@ -62,9 +62,13 @@ router.post(
       const player = req.player;
 
       // ── Anti-farming check ────────────────────────────────────────────────
-      player.resetDailyRewardsIfNeeded();
+      const playerDoc = await Player.findById(player._id);
+      if (playerDoc.resetDailyRewardsIfNeeded) {
+        playerDoc.resetDailyRewardsIfNeeded();
+      }
+
       const maxPerDay = parseInt(process.env.MAX_REWARDS_PER_DAY) || 10;
-      if (player.rewardsClaimedToday >= maxPerDay) {
+      if (playerDoc.rewardsClaimedToday >= maxPerDay) {
         return res.status(429).json({
           success: false,
           message: `Daily reward limit reached (${maxPerDay}/day). Try again tomorrow.`,
@@ -84,9 +88,9 @@ router.post(
       const profileHash = crypto.createHash("sha256").update(profileJson).digest("hex");
 
       // ── Create match record ───────────────────────────────────────────────
-      const matchId    = uuidv4();
-      const ttl        = parseInt(process.env.MATCH_TOKEN_TTL) || 3600;
-      const expiry     = new Date(Date.now() + ttl * 1000);
+      const matchId = uuidv4();
+      const ttl     = parseInt(process.env.MATCH_TOKEN_TTL) || 3600;
+      const expiry  = new Date(Date.now() + ttl * 1000);
 
       // Signed match token — Unity sends this back with result
       const matchToken = jwt.sign(
@@ -97,7 +101,7 @@ router.post(
 
       const match = await Match.create({
         matchId,
-        playerId:          player._id,
+        playerId: player._id,
         aiProfile: {
           ...profile,
           profileHash,
@@ -107,12 +111,11 @@ router.post(
         matchTokenExpiry: expiry,
       });
 
-      // ── Return profile to Unity ───────────────────────────────────────────
       return res.status(201).json({
-        success: true,
+        success:    true,
         matchId:    match.matchId,
         matchToken,
-        aiProfile:  profile,   // Unity AI Engine applies these values
+        aiProfile:  profile,
         expiresAt:  expiry,
       });
     } catch (err) {
@@ -125,7 +128,7 @@ router.post(
 /**
  * POST /api/match/submit-result
  *
- * Unity calls this when match ends.
+ * Unity calls this when match ends (full anti-cheat flow).
  * Backend validates the result before triggering reward.
  *
  * Body: {
@@ -135,7 +138,7 @@ router.post(
  *   playerScore: number,
  *   aiScore: number,
  *   durationSecs: number,
- *   clientProfileHash: string   ← hash of the AI profile Unity actually used
+ *   clientProfileHash: string
  * }
  */
 router.post(
@@ -166,7 +169,7 @@ router.post(
         return res.status(409).json({ success: false, message: "Match already submitted" });
       }
 
-      // ── Validate match token ───────────────────────────────────────────────
+      // ── Validate match token ──────────────────────────────────────────────
       let tokenPayload;
       try {
         tokenPayload = jwt.verify(matchToken, process.env.JWT_SECRET);
@@ -177,35 +180,27 @@ router.post(
         return res.status(401).json({ success: false, message: "Invalid or expired match token" });
       }
 
-      // ── Anti-cheat validations ─────────────────────────────────────────────
+      // ── Anti-cheat validations ────────────────────────────────────────────
       const flags = [];
 
-      // 1. Profile hash must match what backend assigned
-      if (clientProfileHash !== match.aiProfile.profileHash) {
+      if (clientProfileHash !== match.aiProfile.profileHash)
         flags.push("wrong_profile_hash");
-      }
 
-      // 2. Score sanity check (can't win 7-0 in under 30 seconds)
-      const maxGoalRate = (Math.max(playerScore, aiScore)) / durationSecs;
+      const maxGoalRate = Math.max(playerScore, aiScore) / durationSecs;
       if (maxGoalRate > 0.3) flags.push("score_too_fast");
 
-      // 3. Score must match winner
       if (winner === "player" && playerScore <= aiScore) flags.push("score_winner_mismatch");
-      if (winner === "ai"     && aiScore <= playerScore)   flags.push("score_winner_mismatch");
+      if (winner === "ai"     && aiScore <= playerScore) flags.push("score_winner_mismatch");
 
       if (flags.length > 0) {
-        match.status         = "suspicious";
-        match.suspicionFlags = flags;
+        match.status             = "suspicious";
+        match.suspicionFlags     = flags;
         match.clientReportedHash = clientProfileHash;
         await match.save();
-        return res.status(422).json({
-          success: false,
-          message: "Match validation failed",
-          flags,
-        });
+        return res.status(422).json({ success: false, message: "Match validation failed", flags });
       }
 
-      // ── Save result ────────────────────────────────────────────────────────
+      // ── Save result ───────────────────────────────────────────────────────
       match.status             = "completed";
       match.winner             = winner;
       match.playerScore        = playerScore;
@@ -215,7 +210,6 @@ router.post(
       match.validationPassed   = true;
       await match.save();
 
-      // Update player stats
       await Player.findByIdAndUpdate(req.player._id, {
         $inc: {
           "stats.totalMatches": 1,
@@ -225,7 +219,7 @@ router.post(
       });
 
       return res.json({
-        success: true,
+        success:   true,
         validated: true,
         winner,
         matchId,
@@ -241,8 +235,74 @@ router.post(
 );
 
 /**
+ * POST /api/match/save
+ *
+ * Simplified save — called by Unity GameManager on match end.
+ * Used when full /create → /submit-result flow is not used.
+ * Populates the matches collection in MongoDB.
+ *
+ * Body: { matchId, playerScore, opponentScore, winner, durationSeconds,
+ *         walletAddress, aiDifficulty, validationPassed }
+ */
+router.post("/save", authenticate, async (req, res) => {
+  try {
+    const {
+      matchId, playerScore, opponentScore,
+      winner, durationSeconds, walletAddress,
+      aiDifficulty, validationPassed,
+    } = req.body;
+
+    const player = req.player;
+
+    // ── Prevent duplicate saves ───────────────────────────────────────────
+    const existing = await Match.findOne({ matchId });
+    if (existing) {
+      return res.json({
+        success: true,
+        matchId: existing.matchId,
+        message: "Match already saved",
+      });
+    }
+
+    // ── Create match record ───────────────────────────────────────────────
+    const match = await Match.create({
+      matchId,
+      playerId:        player._id,
+      playerScore,
+      opponentScore,
+      winner,
+      durationSecs:    durationSeconds,
+      walletAddress:   walletAddress || player.walletAddress,
+      validationPassed: validationPassed || false,
+      status:          "completed",
+      aiProfile: {
+        difficulty: aiDifficulty || "medium",
+      },
+    });
+
+    // ── Update player stats ───────────────────────────────────────────────
+    const statsUpdate = winner === "player"
+      ? { $inc: { "stats.wins": 1,   "stats.totalMatches": 1 } }
+      : winner === "tie"
+      ? { $inc: { "stats.ties": 1,   "stats.totalMatches": 1 } }
+      : { $inc: { "stats.losses": 1, "stats.totalMatches": 1 } };
+
+    await Player.findByIdAndUpdate(player._id, statsUpdate);
+
+    return res.json({ success: true, matchId: match.matchId, message: "Match saved" });
+  } catch (err) {
+    console.error("[Match] Save error:", err);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to save match",
+      error:   err.message,
+    });
+  }
+});
+
+/**
  * GET /api/match/history
- * Returns the authenticated player's match history.
+ * Returns the authenticated player's last 20 matches.
  */
 router.get("/history", authenticate, async (req, res) => {
   try {
