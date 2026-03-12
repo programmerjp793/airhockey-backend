@@ -1,12 +1,13 @@
 // routes/payment.js
+// Native ETH only (Sepolia) — no TTK, no ERC-20
 const express = require("express");
 const axios   = require("axios");
 const crypto  = require("crypto");
 const { body, validationResult } = require("express-validator");
 
-const { Transaction } = require("../models/Match");
-const Player          = require("../models/Player");
-const authenticate    = require("../middleware/authenticate");
+const { Transaction }   = require("../models/Match");
+const Player            = require("../models/Player");
+const authenticate      = require("../middleware/authenticate");
 const blockchainService = require("../services/blockchainService");
 
 const router = express.Router();
@@ -21,6 +22,14 @@ const ITEM_PRICES_PHP = {
   feature_custom_skin:  5900,  // PHP 59.00
 };
 
+// SmartStore.sol item IDs (match constructor seed order)
+const ITEM_STORE_IDS = {
+  wallet_upgrade_1:    1,
+  wallet_upgrade_2:    2,
+  feature_ai_replay:   3,
+  feature_custom_skin: 4,
+};
+
 const ITEM_NAMES = {
   wallet_upgrade_1:    "Wallet Slot Upgrade I",
   wallet_upgrade_2:    "Wallet Slot Upgrade II",
@@ -28,10 +37,33 @@ const ITEM_NAMES = {
   feature_custom_skin: "Custom Puck Skin",
 };
 
-/**
- * POST /api/payment/create-intent
- * Creates a PayMongo Checkout Session and returns a hosted checkout URL.
- */
+// ── POST /api/payment/prepare-store-tx ───────────────────────────────────────
+// Returns MetaMask Mobile deep link for payable ETH purchaseItem() tx.
+// No approve() step — pure native ETH.
+router.post(
+  "/prepare-store-tx",
+  authenticate,
+  [body("itemId").isInt({ min: 1 })],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty())
+      return res.status(400).json({ success: false, errors: errors.array() });
+
+    try {
+      const txData = await blockchainService.prepareStorePurchaseTx(
+        req.player.walletAddress,
+        req.body.itemId
+      );
+      return res.json({ success: true, ...txData });
+    } catch (err) {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+  }
+);
+
+// ── POST /api/payment/create-intent ──────────────────────────────────────────
+// Creates a PayMongo Checkout Session (fiat path — GCash / card).
+// ETH balance is NOT affected by fiat purchases.
 router.post(
   "/create-intent",
   authenticate,
@@ -71,6 +103,7 @@ router.post(
                 playerId:      player._id.toString(),
                 walletAddress: player.walletAddress || "",
                 itemId,
+                storeItemId:   ITEM_STORE_IDS[itemId],
               },
             },
           },
@@ -86,7 +119,7 @@ router.post(
       const session     = response.data.data;
       const checkoutUrl = session.attributes.checkout_url;
 
-      // Store pending transaction
+      // Store pending transaction in DB
       await Transaction.create({
         playerId:        player._id,
         txType:          "store_fiat_purchase",
@@ -95,6 +128,7 @@ router.post(
         fiatAmount:      pricePhp,
         fiatCurrency:    "PHP",
         itemId,
+        storeItemId:     ITEM_STORE_IDS[itemId],
         status:          "pending",
       });
 
@@ -106,6 +140,8 @@ router.post(
         checkoutUrl,
         amount:          pricePhp,
         currency:        "PHP",
+        // ETH balance is unaffected — fiat purchase is separate from on-chain ETH
+        note: "Your ETH balance is not affected by fiat purchases",
       });
 
     } catch (err) {
@@ -122,12 +158,12 @@ router.post(
   }
 );
 
-/**
- * POST /api/payment/webhook
- * Handles PayMongo webhook events.
- */
-router.post("/webhook", async (req, res) => {
+// ── POST /api/payment/webhook ─────────────────────────────────────────────────
+// Handles PayMongo webhook — on payment success, records fiat purchase on Sepolia.
+// No ETH burn — player ETH balance stays intact.
+router.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
+    // ── Verify HMAC signature ─────────────────────────────────────────────
     const sigHeader = req.headers["paymongo-signature"];
 
     if (sigHeader) {
@@ -156,55 +192,65 @@ router.post("/webhook", async (req, res) => {
                    || eventType === "payment.paid"
                    || eventType === "checkout_session.payment.paid";
 
-    if (isSuccess) {
-      const attrs = event.data.attributes;
+    if (!isSuccess) return res.sendStatus(200);
 
-      // Handle both checkout_session and payment_intent event shapes
-      const paymentIntentId = attrs.data?.id
-                           || attrs.payment_intent_id
-                           || event.data.id;
+    // ── Extract metadata ──────────────────────────────────────────────────
+    const attrs = event.data.attributes;
 
-      const metadata = attrs.data?.attributes?.metadata
-                    || attrs.metadata
-                    || {};
+    const paymentIntentId = attrs.data?.id
+                         || attrs.payment_intent_id
+                         || event.data.id;
 
-      const { playerId, itemId } = metadata;
+    const metadata = attrs.data?.attributes?.metadata
+                  || attrs.metadata
+                  || {};
 
-      if (!playerId || !itemId) {
-        console.error("[Payment] Missing metadata:", metadata);
-        return res.status(422).json({ message: "Missing metadata" });
-      }
+    const { playerId, walletAddress, itemId } = metadata;
 
-      const txRecord = await Transaction.findOne({ paymentIntentId, status: "pending" });
-      if (!txRecord) {
-        console.warn("[Payment] No pending transaction for:", paymentIntentId);
-        return res.sendStatus(200);
-      }
-
-      const player = await Player.findById(playerId);
-      if (!player?.walletAddress) {
-        txRecord.status = "failed";
-        await txRecord.save();
-        return res.status(422).json({ message: "Player has no wallet" });
-      }
-
-      const { txHash } = await blockchainService.grantStoreItemAfterFiat(
-        player.walletAddress,
-        itemId,
-        paymentIntentId
-      );
-
-      txRecord.status = "confirmed";
-      txRecord.txHash = txHash;
-      await txRecord.save();
-
-      if (!player.ownedItems.includes(itemId)) {
-        player.ownedItems.push(itemId);
-        await player.save();
-      }
-
-      console.log(`[Payment] ✅ Item "${itemId}" granted | tx: ${txHash}`);
+    if (!playerId || !itemId) {
+      console.error("[Payment] Missing metadata:", metadata);
+      return res.status(422).json({ message: "Missing metadata" });
     }
+
+    // ── Find pending transaction ──────────────────────────────────────────
+    const txRecord = await Transaction.findOne({ paymentIntentId, status: "pending" });
+    if (!txRecord) {
+      console.warn("[Payment] No pending transaction for:", paymentIntentId);
+      return res.sendStatus(200);
+    }
+
+    // ── Resolve player wallet address ─────────────────────────────────────
+    const player       = await Player.findById(playerId);
+    const playerWallet = walletAddress || player?.walletAddress;
+
+    if (!playerWallet) {
+      txRecord.status = "failed";
+      await txRecord.save();
+      return res.status(422).json({ message: "Player has no wallet address" });
+    }
+
+    // ── Record fiat purchase on Sepolia (native ETH — no burn) ────────────
+    // Uses paymentIntentId as unique on-chain reference (replay guard)
+    const fiatAmount = attrs.data?.attributes?.amount || txRecord.fiatAmount;
+    const result = await blockchainService.processFiatPurchase(
+      playerWallet,
+      fiatAmount,
+      "paymongo",
+      paymentIntentId
+    );
+
+    // ── Update DB ─────────────────────────────────────────────────────────
+    txRecord.status = "confirmed";
+    txRecord.txHash = result.txHash;
+    await txRecord.save();
+
+    if (!player.ownedItems.includes(itemId)) {
+      player.ownedItems.push(itemId);
+      await player.save();
+    }
+
+    console.log(`[Payment] ✅ Item "${itemId}" granted | tx: ${result.txHash}`);
+    console.log(`[Payment] 🔗 ${result.explorerUrl}`);
 
     return res.sendStatus(200);
 
@@ -214,30 +260,28 @@ router.post("/webhook", async (req, res) => {
   }
 });
 
-/**
- * GET /api/payment/status/:paymentIntentId
- * Unity polls this after checkout to check if payment succeeded.
- */
+// ── GET /api/payment/status/:paymentIntentId ──────────────────────────────────
+// Unity polls this after checkout to check if payment succeeded.
 router.get("/status/:paymentIntentId", authenticate, async (req, res) => {
   try {
     const { paymentIntentId } = req.params;
 
     // Try checkout_session first, fallback to payment_intent
-    let status;
+    let pmStatus;
     try {
       const response = await axios.get(
         `${PAYMONGO_BASE}/checkout_sessions/${paymentIntentId}`,
         { headers: { Authorization: `Basic ${PAYMONGO_AUTH}` } }
       );
-      status = response.data.data.attributes.payment_intent?.attributes?.status
-            || response.data.data.attributes.status
-            || "unknown";
+      pmStatus = response.data.data.attributes.payment_intent?.attributes?.status
+              || response.data.data.attributes.status
+              || "unknown";
     } catch {
       const response = await axios.get(
         `${PAYMONGO_BASE}/payment_intents/${paymentIntentId}`,
         { headers: { Authorization: `Basic ${PAYMONGO_AUTH}` } }
       );
-      status = response.data.data.attributes.status;
+      pmStatus = response.data.data.attributes.status;
     }
 
     const txRecord = await Transaction.findOne({
@@ -247,11 +291,12 @@ router.get("/status/:paymentIntentId", authenticate, async (req, res) => {
 
     return res.json({
       success:     true,
-      status,
+      status:      txRecord?.status || pmStatus,
       txHash:      txRecord?.txHash || null,
       itemId:      txRecord?.itemId || null,
+      // Updated: Sepolia explorer (was amoy.polygonscan.com)
       explorerUrl: txRecord?.txHash
-        ? `https://amoy.polygonscan.com/tx/${txRecord.txHash}`
+        ? `https://sepolia.etherscan.io/tx/${txRecord.txHash}`
         : null,
     });
 
@@ -262,18 +307,12 @@ router.get("/status/:paymentIntentId", authenticate, async (req, res) => {
   }
 });
 
-/**
- * GET /api/payment/success
- * Redirect page after successful PayMongo checkout.
- */
+// ── GET /api/payment/success ──────────────────────────────────────────────────
 router.get("/success", (req, res) => {
   res.send("<h2>✅ Payment successful! Return to the game.</h2>");
 });
 
-/**
- * GET /api/payment/cancel
- * Redirect page after cancelled PayMongo checkout.
- */
+// ── GET /api/payment/cancel ───────────────────────────────────────────────────
 router.get("/cancel", (req, res) => {
   res.send("<h2>❌ Payment cancelled. Return to the game.</h2>");
 });

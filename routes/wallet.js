@@ -1,6 +1,14 @@
 // routes/wallet.js
-// GET /wallet/balance  → TTK token balance for authenticated player's wallet
-// GET /wallet/info     → full profile: player data + TTK balance + owned items
+// Native ETH only (Sepolia Testnet)
+//
+// Changes from existing:
+//   • getTokenBalance()  → getPlayerInfo() — ETH balance lives in getPlayerInfo()
+//   • symbol: 'TTK'      → symbol: 'ETH'
+//   • amoy.polygonscan   → sepolia.etherscan (via BLOCK_EXPLORER_URL env)
+//   • /balance response: balanceFormatted now shows ETH, tier added
+//   • /info response:    wallet.symbol now 'ETH', tier added
+//   • Removed: doesPlayerOwnItem loop in /info (now handled by getPlayerInfo)
+//   • Kept: /balance, /info, /transactions structure exactly
 
 const express           = require('express');
 const router            = express.Router();
@@ -8,8 +16,11 @@ const authenticate      = require('../middleware/authenticate');
 const blockchainService = require('../services/blockchainService');
 const Player            = require('../models/Player');
 
+const EXPLORER = process.env.BLOCK_EXPLORER_URL || 'https://sepolia.etherscan.io';
+
 // ─── GET /wallet/balance ──────────────────────────────────────────────────────
-// Returns the TTK token balance for the authenticated player's linked wallet.
+// Returns the native ETH balance for the authenticated player's linked wallet.
+// Unity WalletManager.RefreshBalanceAsync() calls: GET /wallet/balance?address=0x...
 
 router.get('/balance', authenticate, async (req, res, next) => {
   try {
@@ -24,20 +35,24 @@ router.get('/balance', authenticate, async (req, res, next) => {
         success:          true,
         walletAddress:    null,
         balance:          '0',
-        balanceFormatted: '0.00',
-        symbol:           'TTK',
+        balanceFormatted: '0.0000',
+        symbol:           'ETH',       // was 'TTK'
+        tier:             0,
         note:             'No wallet linked. Connect MetaMask to see your balance.',
       });
     }
 
-    const balanceData = await blockchainService.getTokenBalance(player.walletAddress);
+    // FIX: was blockchainService.getTokenBalance() — no longer exists.
+    // getPlayerInfo() returns { address, ethBalance, ethBalanceWei, tier, ownedItemIds }
+    const info = await blockchainService.getPlayerInfo(player.walletAddress);
 
     return res.json({
       success:          true,
       walletAddress:    player.walletAddress,
-      balance:          balanceData.raw,            // raw wei string
-      balanceFormatted: balanceData.formatted,      // e.g. "12.50"
-      symbol:           balanceData.symbol || 'TTK',
+      balance:          info.ethBalanceWei,   // raw wei string
+      balanceFormatted: info.ethBalance,      // e.g. "0.0250" ETH
+      symbol:           'ETH',                // was 'TTK'
+      tier:             info.tier,
     });
 
   } catch (err) {
@@ -47,11 +62,8 @@ router.get('/balance', authenticate, async (req, res, next) => {
 });
 
 // ─── GET /wallet/info ─────────────────────────────────────────────────────────
-// Returns full player profile including:
-//   - Unity identity
-//   - Wallet address + TTK balance
-//   - Game stats (wins, losses, rewards)
-//   - Owned store items (synced from blockchain)
+// Returns full player profile: identity + ETH balance + tier + owned items.
+// ETH balance is fetched via getPlayerInfo() which reads SmartStore + RewardEngine.
 
 router.get('/info', authenticate, async (req, res, next) => {
   try {
@@ -61,29 +73,24 @@ router.get('/info', authenticate, async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Player not found.' });
     }
 
-    let balanceData  = { raw: '0', formatted: '0.00', symbol: 'TTK' };
-    let ownedItems   = player.ownedItems || [];
-    let onChainError = null;
+    // FIX: was getTokenBalance() then separate doesPlayerOwnItem() loop.
+    // Now getPlayerInfo() returns everything in one call.
+    let ethBalance    = '0.0000';
+    let ethBalanceWei = '0';
+    let tier          = 0;
+    let ownedItems    = player.ownedItems || [];
+    let onChainError  = null;
 
-    // If wallet is linked, fetch live blockchain data
     if (player.walletAddress) {
       try {
-        balanceData = await blockchainService.getTokenBalance(player.walletAddress);
+        const info = await blockchainService.getPlayerInfo(player.walletAddress);
+        ethBalance    = info.ethBalance;       // formatted ETH string
+        ethBalanceWei = info.ethBalanceWei;
+        tier          = info.tier;
+        ownedItems    = info.ownedItemIds || ownedItems;
 
-        // Refresh owned items from chain
-        const allItems = await blockchainService.getStoreItems();
-        const onChainOwned = [];
-
-        for (const item of allItems) {
-          const owns = await blockchainService.doesPlayerOwnItem(
-            player.walletAddress,
-            item.itemId
-          );
-          if (owns) onChainOwned.push(item.itemId);
-        }
-
-        ownedItems        = onChainOwned;
-        player.ownedItems = onChainOwned;
+        // Sync owned items to MongoDB for offline reference
+        player.ownedItems = ownedItems;
         await player.save();
 
       } catch (chainErr) {
@@ -107,9 +114,10 @@ router.get('/info', authenticate, async (req, res, next) => {
       },
       wallet: {
         address:          player.walletAddress,
-        balance:          balanceData.raw,
-        balanceFormatted: balanceData.formatted,
-        symbol:           balanceData.symbol || 'TTK',
+        balance:          ethBalanceWei,
+        balanceFormatted: ethBalance,
+        symbol:           'ETH',   // was 'TTK'
+        tier,
       },
       ...(onChainError && { warning: onChainError }),
     });
@@ -121,11 +129,12 @@ router.get('/info', authenticate, async (req, res, next) => {
 });
 
 // ─── GET /wallet/transactions ─────────────────────────────────────────────────
-// Returns recent reward transactions for the player from MongoDB.
+// Returns recent reward transactions for the player.
+// explorerUrl now points to sepolia.etherscan.io (was amoy.polygonscan.com).
 
 router.get('/transactions', authenticate, async (req, res, next) => {
   try {
-    const Match = require('../models/Match');
+    const { Match } = require('../models/Match');
 
     const matches = await Match.find({
       playerId: req.player.id,
@@ -139,7 +148,7 @@ router.get('/transactions', authenticate, async (req, res, next) => {
       matchId:     m.matchId,
       amount:      m.rewardAmount,
       txHash:      m.rewardTxHash,
-      explorerUrl: `${process.env.BLOCK_EXPLORER_URL}/tx/${m.rewardTxHash}`,
+      explorerUrl: `${EXPLORER}/tx/${m.rewardTxHash}`,  // was amoy.polygonscan.com
       claimedAt:   m.rewardClaimedAt,
       difficulty:  m.difficulty,
       winner:      m.winner,
