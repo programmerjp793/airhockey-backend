@@ -22,11 +22,12 @@ router.get('/items', async (req, res, next) => {
   try {
     const items = await blockchainService.getStoreItems();
 
-    // Optional: filter by itemType query param e.g. ?type=wallet_upgrade
+    // FIX: removed i.active filter — getActiveItems() already handles this.
+    // getStoreItems() now sets active:true on all returned items.
     const { type } = req.query;
     const filtered = type
-      ? items.filter(i => i.active && i.itemType === type)
-      : items.filter(i => i.active);
+      ? items.filter(i => i.itemType === type)
+      : items;
 
     return res.json({
       success: true,

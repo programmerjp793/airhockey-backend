@@ -19,6 +19,14 @@ const smartStore   = new ethers.Contract(process.env.SMART_STORE_ADDRESS, SmartS
 const toWei   = (eth) => ethers.parseEther(String(eth));
 const fromWei = (wei) => parseFloat(ethers.formatEther(wei));
 
+// Maps numeric contract ID → string itemId used by Unity/backend
+const ITEM_ID_MAP = {
+  1: "wallet_upgrade_1",
+  2: "wallet_upgrade_2",
+  3: "ai_replay",
+  4: "custom_skin",
+};
+
 async function waitForTx(tx, label) {
   console.log(`⏳ ${label}: ${tx.hash}`);
   const receipt = await tx.wait(1);
@@ -110,29 +118,50 @@ async function prepareStorePurchaseTx(playerAddress, itemId) {
 // D. Get player info
 async function getPlayerInfo(playerAddress) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid address");
-  const ethBalance  = await provider.getBalance(playerAddress);
-  const [, tier, ownedItems] = await smartStore.getPlayerInfo(playerAddress);
-  const storeItems  = await smartStore.getActiveItems();
-  const rewardPool  = await rewardEngine.getRewardPoolBalance();
+
+  const ethBalance           = await provider.getBalance(playerAddress);
+  const [, tier, ownedFlags] = await smartStore.getPlayerInfo(playerAddress);
+  const storeItems           = await smartStore.getActiveItems();
+  const rewardPool           = await rewardEngine.getRewardPoolBalance();
+
+  // Build ownedItemIds — list of string itemIds the player owns
+  const ownedItemIds = ownedFlags
+    .map((owned, i) => owned ? (ITEM_ID_MAP[Number(storeItems[i]?.id)] || `item_${i + 1}`) : null)
+    .filter(Boolean);
+
   return {
-    address: playerAddress,
-    ethBalance: ethers.formatEther(ethBalance),
-    tier: Number(tier),
-    ownedItems: ownedItems.map((owned, i) => ({ itemId: Number(storeItems[i]?.id || i + 1), owned })),
+    address:       playerAddress,
+    ethBalance:    ethers.formatEther(ethBalance),
+    tier:          Number(tier),
+    ownedItemIds,
+    ownedItems:    ownedFlags.map((owned, i) => ({
+      itemId: Number(storeItems[i]?.id || i + 1),
+      owned,
+    })),
     rewardPoolETH: fromWei(rewardPool),
-    network: "Sepolia",
-    explorerUrl: `https://sepolia.etherscan.io/address/${playerAddress}`,
+    network:       "Sepolia",
+    explorerUrl:   `https://sepolia.etherscan.io/address/${playerAddress}`,
   };
 }
 
 // E. Get store items
+// FIX: added itemId (string), numericId, priceETHFormatted, active fields
 async function getStoreItems() {
   const items = await smartStore.getActiveItems();
-  return items.map(item => ({
-    id: Number(item.id), name: item.name, itemType: item.itemType,
-    priceETH: fromWei(item.priceETH), pricePHP: Number(item.pricePHP) / 100,
-    tier: Number(item.tier),
-  }));
+  return items.map(item => {
+    const numericId = Number(item.id);
+    return {
+      itemId:            ITEM_ID_MAP[numericId] || `item_${numericId}`,
+      numericId,
+      name:              item.name,
+      itemType:          item.itemType,
+      priceETH:          fromWei(item.priceETH),
+      priceETHFormatted: fromWei(item.priceETH).toFixed(4),
+      pricePHP:          Number(item.pricePHP) / 100,
+      tier:              Number(item.tier),
+      active:            true,   // getActiveItems() only returns active items
+    };
+  });
 }
 
 // F. Deposit to reward pool
