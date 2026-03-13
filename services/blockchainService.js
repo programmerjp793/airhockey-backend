@@ -2,8 +2,13 @@
 const { ethers } = require("ethers");
 require("dotenv").config();
 
-const RewardEngineABI = require("../abis/RewardEngine.json");
-const SmartStoreABI   = require("../abis/SmartStore.json");
+// FIX: Hardhat artifacts store the ABI nested under a .abi property.
+// Extract it — ethers.Contract() needs a plain array, not the full artifact object.
+const RewardEngineArtifact = require("../abis/RewardEngine.json");
+const SmartStoreArtifact   = require("../abis/SmartStore.json");
+
+const RewardEngineABI = RewardEngineArtifact.abi ?? RewardEngineArtifact;
+const SmartStoreABI   = SmartStoreArtifact.abi   ?? SmartStoreArtifact;
 
 const provider     = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
 const backendWallet = new ethers.Wallet(process.env.BACKEND_SIGNER_PRIVATE_KEY, provider);
