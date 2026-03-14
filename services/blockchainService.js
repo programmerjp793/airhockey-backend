@@ -121,23 +121,10 @@ async function prepareStorePurchaseTx(playerAddress, itemId) {
 async function getPlayerInfo(playerAddress) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid address");
 
-  const ethBalance = await provider.getBalance(playerAddress);
-
-  // Guard: getPlayerInfo may return BAD_DATA for new players with no contract interaction
-  let tier = 0;
-  let ownedFlags = [];
-  let storeItems = [];
-  try {
-    const result = await smartStore.getPlayerInfo(playerAddress);
-    tier       = Number(result[1]);
-    ownedFlags = Array.from(result[2]);
-    storeItems = await smartStore.getActiveItems();
-  } catch (e) {
-    console.warn(`[Blockchain] getPlayerInfo fallback for ${playerAddress}: ${e.message}`);
-    // New player — no contract state yet, return empty defaults
-  }
-
-  const rewardPool = await rewardEngine.getRewardPoolBalance();
+  const ethBalance           = await provider.getBalance(playerAddress);
+  const [, tier, ownedFlags] = await smartStore.getPlayerInfo(playerAddress);
+  const storeItems           = await smartStore.getActiveItems();
+  const rewardPool           = await rewardEngine.getRewardPoolBalance();
 
   // Build ownedItemIds — list of string itemIds the player owns
   const ownedItemIds = ownedFlags
@@ -147,7 +134,7 @@ async function getPlayerInfo(playerAddress) {
   return {
     address:       playerAddress,
     ethBalance:    ethers.formatEther(ethBalance),
-    tier,
+    tier:          Number(tier),
     ownedItemIds,
     ownedItems:    ownedFlags.map((owned, i) => ({
       itemId: Number(storeItems[i]?.id || i + 1),
