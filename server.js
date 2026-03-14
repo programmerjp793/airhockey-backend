@@ -54,7 +54,7 @@ mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {
     console.log("✅ MongoDB connected");
-    app.listen(PORT, () =>
+    app.listen(PORT, "0.0.0.0", () =>
       console.log(`🚀 Backend running on port ${PORT} [${process.env.NODE_ENV}]`)
     );
   })
