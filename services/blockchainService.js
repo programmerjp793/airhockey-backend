@@ -10,11 +10,11 @@ const SmartStoreArtifact   = require("../abis/SmartStore.json");
 const RewardEngineABI = RewardEngineArtifact.abi ?? RewardEngineArtifact;
 const SmartStoreABI   = SmartStoreArtifact.abi   ?? SmartStoreArtifact;
 
-const provider     = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
+const provider      = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
 const backendWallet = new ethers.Wallet(process.env.BACKEND_SIGNER_PRIVATE_KEY, provider);
 
 const rewardEngine = new ethers.Contract(process.env.REWARD_ENGINE_ADDRESS, RewardEngineABI, backendWallet);
-const smartStore   = new ethers.Contract(process.env.SMART_STORE_ADDRESS, SmartStoreABI, backendWallet);
+const smartStore   = new ethers.Contract(process.env.SMART_STORE_ADDRESS,   SmartStoreABI,   backendWallet);
 
 const toWei   = (eth) => ethers.parseEther(String(eth));
 const fromWei = (wei) => parseFloat(ethers.formatEther(wei));
@@ -87,28 +87,30 @@ async function prepareStorePurchaseTx(playerAddress, itemId) {
   const encodedId = BigInt(itemId).toString(16).padStart(64, "0");
   const callData  = selector + encodedId;
 
-  const params  = new URLSearchParams({
-    to: process.env.SMART_STORE_ADDRESS, data: callData,
-    value: item.priceETH.toString(), chainId: "0xaa36a7",
-    gasLimit: ((gasEst * 120n) / 100n).toString(),
-  });
-  const deepLink = `metamask://send?${params.toString()}`;
+  const storeAddress = process.env.SMART_STORE_ADDRESS;
+  const valueWei     = item.priceETH.toString();
+  const gasLimit     = ((gasEst * 120n) / 100n).toString();
+
+  // FIX: MetaMask Mobile deep link format:
+  // metamask://send/{contractAddress}@{chainId}?value={wei}&data={calldata}&gasLimit={gas}
+  // Do NOT use URLSearchParams — MetaMask rejects percent-encoded characters (%3A, %2F etc.)
+  const deepLink = `metamask://send/${storeAddress}@11155111?value=${valueWei}&data=${callData}&gasLimit=${gasLimit}`;
 
   return {
     needsApproval: false,
     step:          "purchase",
-    storeAddress:  process.env.SMART_STORE_ADDRESS,
+    storeAddress,
     chainId:       11155111,
     chainIdHex:    "0xaa36a7",
     itemId:        Number(item.id),
     itemName:      item.name,
     itemType:      item.itemType,
     priceETH:      fromWei(item.priceETH),
-    priceETHWei:   item.priceETH.toString(),
+    priceETHWei:   valueWei,
     pricePHP:      Number(item.pricePHP) / 100,
     tier:          Number(item.tier),
     deepLink,
-    gasLimit:      ((gasEst * 120n) / 100n).toString(),
+    gasLimit,
     maxFeePerGas:  feeData.maxFeePerGas?.toString(),
     explorerBase:  "https://sepolia.etherscan.io",
     message:       `Sign to purchase: ${item.name} (${fromWei(item.priceETH)} ETH)`,
@@ -159,7 +161,7 @@ async function getStoreItems() {
       priceETHFormatted: fromWei(item.priceETH).toFixed(4),
       pricePHP:          Number(item.pricePHP) / 100,
       tier:              Number(item.tier),
-      active:            true,   // getActiveItems() only returns active items
+      active:            true,
     };
   });
 }
