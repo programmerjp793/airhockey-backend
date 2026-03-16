@@ -8,7 +8,6 @@ const mongoose = require("mongoose");
 
 const authRoutes    = require("./routes/auth");
 const matchRoutes   = require("./routes/match");
-const rewardRoutes  = require("./routes/reward");
 const storeRoutes   = require("./routes/store");
 const paymentRoutes = require("./routes/payment");
 const walletRoutes  = require("./routes/wallet");
@@ -29,16 +28,13 @@ app.use(morgan("dev"));
 app.use(globalLimiter);
 
 // ─── Body Parsers ─────────────────────────────────────────────────────────────
-// NOTE: PayMongo webhooks need raw body — must come BEFORE express.json()
-app.use("/api/payment/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "10kb" }));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.use("/api/auth",    authRoutes);    // Unity Auth → Player login / register
 app.use("/api/match",   matchRoutes);   // Create AI match, submit result
-app.use("/api/reward",  rewardRoutes);  // Win verification + blockchain reward
-app.use("/api/store",   storeRoutes);   // SmartStore item listing
-app.use("/api/payment", paymentRoutes); // PayMongo payment intents + webhooks
+app.use("/api/store",   storeRoutes);   // SmartStore item listing + admin management
+app.use("/api/purchase", paymentRoutes); // Item purchase flow (prepare, confirm)
 app.use("/api/wallet",  walletRoutes);  // Player wallet info + token balance
 
 // ─── Health Check ─────────────────────────────────────────────────────────────
@@ -49,7 +45,7 @@ app.get("/health", (_req, res) =>
 // ─── Error Handler ────────────────────────────────────────────────────────────
 app.use(errorHandler);
 
-// ─── Database + Server Start ──────────────────────────────────────────────────
+// ─── Database + Server Start ─────────────────────────────────────────────────
 mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {

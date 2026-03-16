@@ -1,22 +1,25 @@
-// services/blockchainService.js — Native ETH only
+// services/blockchainService.js — Native ETH only, for new SmartStore.sol
 const { ethers } = require("ethers");
 require("dotenv").config();
 
 // FIX: Hardhat artifacts store the ABI nested under a .abi property.
 // Extract it — ethers.Contract() needs a plain array, not the full artifact object.
-const RewardEngineArtifact = require("../abis/RewardEngine.json");
-const SmartStoreArtifact   = require("../abis/SmartStore.json");
+const SmartStoreArtifact = require("../abis/SmartStore.json");
 
-const RewardEngineABI = RewardEngineArtifact.abi ?? RewardEngineArtifact;
-const SmartStoreABI   = SmartStoreArtifact.abi   ?? SmartStoreArtifact;
+const SmartStoreABI = SmartStoreArtifact.abi ?? SmartStoreArtifact;
 
-const provider      = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
-const backendWallet = new ethers.Wallet(process.env.BACKEND_SIGNER_PRIVATE_KEY, provider);
+const provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
 
-const rewardEngine = new ethers.Contract(process.env.REWARD_ENGINE_ADDRESS, RewardEngineABI, backendWallet);
-const smartStore   = new ethers.Contract(process.env.SMART_STORE_ADDRESS,   SmartStoreABI,   backendWallet);
+// Use provider for read-only operations, wallet only when private key is available
+let signer = provider;
+if (process.env.BACKEND_SIGNER_PRIVATE_KEY) {
+  signer = new ethers.Wallet(process.env.BACKEND_SIGNER_PRIVATE_KEY, provider);
+}
 
-const toWei   = (eth) => ethers.parseEther(String(eth));
+const smartStore = new ethers.Contract(process.env.SMART_STORE_ADDRESS, SmartStoreABI, signer);
+
+// Wei conversion functions
+const toWei = (eth) => ethers.parseEther(String(eth));
 const fromWei = (wei) => parseFloat(ethers.formatEther(wei));
 
 // Maps numeric contract ID → string itemId used by Unity/backend
@@ -34,178 +37,274 @@ async function waitForTx(tx, label) {
   return receipt;
 }
 
-// A. Reward player with native ETH
-async function rewardPlayer(playerAddress, amountETH, reason = "match_win") {
-  if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
-  const poolBal = await rewardEngine.getRewardPoolBalance();
-  if (poolBal < toWei(amountETH))
-    throw new Error(`Reward pool low. Has ${fromWei(poolBal)} ETH, need ${amountETH} ETH`);
+// ==================== ADMIN FUNCTIONS ====================
 
-  const tx      = await rewardEngine.rewardPlayer(playerAddress, toWei(amountETH), reason);
-  const receipt = await waitForTx(tx, "RewardPlayer");
-  return { txHash: receipt.hash, player: playerAddress, amountETH, reason,
-    explorerUrl: `https://sepolia.etherscan.io/tx/${receipt.hash}` };
+// Create a new item in the store
+async function createItem(name, priceETH, isAvailable) {
+  const priceWei = toWei(priceETH);
+  const tx = await smartStore.createItem(name, priceWei, isAvailable);
+  const receipt = await waitForTx(tx, "CreateItem");
+  return {
+    txHash: receipt.hash,
+    name,
+    priceETH,
+    isAvailable,
+    explorerUrl: `https://sepolia.etherscan.io/tx/${receipt.hash}`,
+  };
 }
 
-// B. Record fiat purchase on-chain (no ETH burn)
-async function processFiatPurchase(playerAddress, fiatCentavos, providerName, referenceId) {
-  if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
-  if (await rewardEngine.isRefProcessed(referenceId))
-    throw new Error(`Reference ${referenceId} already processed`);
-
-  const tx      = await rewardEngine.processFiatPurchase(playerAddress, fiatCentavos, providerName, referenceId);
-  const receipt = await waitForTx(tx, "FiatPurchase");
-  return { txHash: receipt.hash, player: playerAddress, fiatCentavos, provider: providerName, referenceId,
-    explorerUrl: `https://sepolia.etherscan.io/tx/${receipt.hash}` };
+// Set item price
+async function setItemPrice(itemId, priceETH) {
+  const priceWei = toWei(priceETH);
+  const tx = await smartStore.setItemPrice(itemId, priceWei);
+  const receipt = await waitForTx(tx, "SetItemPrice");
+  return {
+    txHash: receipt.hash,
+    itemId,
+    priceETH,
+    explorerUrl: `https://sepolia.etherscan.io/tx/${receipt.hash}`,
+  };
 }
 
-// C. Prepare store purchase TX data for MetaMask Mobile deep link
+// Toggle item availability
+async function toggleItemAvailability(itemId) {
+  const tx = await smartStore.toggleItemAvailability(itemId);
+  const receipt = await waitForTx(tx, "ToggleItemAvailability");
+  return {
+    txHash: receipt.hash,
+    itemId,
+    explorerUrl: `https://sepolia.etherscan.io/tx/${receipt.hash}`,
+  };
+}
+
+// Update multiple item properties at once
+async function updateItem(itemId, name, priceETH, isAvailable) {
+  const priceWei = priceETH > 0 ? toWei(priceETH) : 0;
+  const tx = await smartStore.updateItem(itemId, name, priceWei, isAvailable);
+  const receipt = await waitForTx(tx, "UpdateItem");
+  return {
+    txHash: receipt.hash,
+    itemId,
+    name,
+    priceETH,
+    isAvailable,
+    explorerUrl: `https://sepolia.etherscan.io/tx/${receipt.hash}`,
+  };
+}
+
+// Set treasury address
+async function setTreasury(treasuryAddress) {
+  if (!ethers.isAddress(treasuryAddress)) throw new Error("Invalid treasury address");
+  const tx = await smartStore.setTreasury(treasuryAddress);
+  const receipt = await waitForTx(tx, "SetTreasury");
+  return {
+    txHash: receipt.hash,
+    treasuryAddress,
+    explorerUrl: `https://sepolia.etherscan.io/tx/${receipt.hash}`,
+  };
+}
+
+// ==================== PLAYER FUNCTIONS ====================
+
+// Prepare store purchase TX data for MetaMask Mobile deep link
 async function prepareStorePurchaseTx(playerAddress, itemId) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
 
-  const items = await smartStore.getAllItems();
-  const item  = items.find(i => Number(i.id) === Number(itemId));
-  if (!item || !item.active) throw new Error("Item not found or inactive");
+  // Get item details
+  const item = await smartStore.getItem(itemId);
+  if (!item || item.id === 0) throw new Error("Item not found");
+  if (!item.isAvailable) throw new Error("Item not available");
 
-  const playerTier = await smartStore.playerTier(playerAddress);
-  if (item.tier > 0 && Number(playerTier) !== Number(item.tier) - 1)
-    throw new Error(`Must own Tier ${item.tier - 1} upgrade first`);
+  // Check if player already owns the item
+  const hasItem = await smartStore.hasPlayerBoughtItem(playerAddress, itemId);
+  if (hasItem) throw new Error("Item already owned");
 
+  // Check player balance
   const playerBal = await provider.getBalance(playerAddress);
-  if (playerBal < item.priceETH)
-    throw new Error(`Insufficient ETH. Need ${fromWei(item.priceETH)}, have ${fromWei(playerBal)}`);
-
-  if (await smartStore.playerOwns(playerAddress, itemId))
-    throw new Error("Item already owned");
+  if (playerBal < item.price) {
+    throw new Error(`Insufficient ETH. Need ${fromWei(item.price)}, have ${fromWei(playerBal)}`);
+  }
 
   const feeData = await provider.getFeeData();
-  const gasEst  = await smartStore.purchaseItem.estimateGas(itemId,
-    { from: playerAddress, value: item.priceETH }).catch(() => BigInt(120000));
+  const gasEst = await smartStore.buyItem.estimateGas(itemId, { from: playerAddress, value: item.price }).catch(() => BigInt(120000));
 
-  // purchaseItem(uint256) 4-byte selector + encoded itemId
-  const selector  = "0xd38ea5bf";  // keccak256("purchaseItem(uint256)").slice(0,4)
+  // buyItem(uint256) 4-byte selector + encoded itemId
+  const selector = "0xd38ea5bf"; // keccak256("buyItem(uint256)").slice(0,4)
   const encodedId = BigInt(itemId).toString(16).padStart(64, "0");
-  const callData  = selector + encodedId;
+  const callData = selector + encodedId;
 
   const storeAddress = process.env.SMART_STORE_ADDRESS;
-  const valueWei     = item.priceETH.toString();
-  const gasLimit     = ((gasEst * 120n) / 100n).toString();
+  const valueWei = item.price.toString();
+  const gasLimit = ((gasEst * 120n) / 100n).toString();
 
   // FIX: MetaMask Mobile deep link format:
   // metamask://send/{contractAddress}@{chainId}?value={wei}&data={calldata}&gasLimit={gas}
-  // Do NOT use URLSearchParams — MetaMask rejects percent-encoded characters (%3A, %2F etc.)
   const deepLink = `metamask://send/${storeAddress}@11155111?value=${valueWei}&data=${callData}&gasLimit=${gasLimit}`;
 
   return {
     needsApproval: false,
-    step:          "purchase",
+    step: "purchase",
     storeAddress,
-    chainId:       11155111,
-    chainIdHex:    "0xaa36a7",
-    itemId:        Number(item.id),
-    itemName:      item.name,
-    itemType:      item.itemType,
-    priceETH:      fromWei(item.priceETH),
-    priceETHWei:   valueWei,
-    pricePHP:      Number(item.pricePHP) / 100,
-    tier:          Number(item.tier),
+    chainId: 11155111,
+    chainIdHex: "0xaa36a7",
+    itemId: Number(item.id),
+    itemName: item.name,
+    priceETH: fromWei(item.price),
+    priceETHWei: valueWei,
+    isAvailable: item.isAvailable,
     deepLink,
     gasLimit,
-    maxFeePerGas:  feeData.maxFeePerGas?.toString(),
-    explorerBase:  "https://sepolia.etherscan.io",
-    message:       `Sign to purchase: ${item.name} (${fromWei(item.priceETH)} ETH)`,
+    maxFeePerGas: feeData.maxFeePerGas?.toString(),
+    explorerBase: "https://sepolia.etherscan.io",
+    message: `Sign to purchase: ${item.name} (${fromWei(item.price)} ETH)`,
   };
 }
 
-// D. Get player info
+// Get player info
 async function getPlayerInfo(playerAddress) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid address");
 
   const ethBalance = await provider.getBalance(playerAddress);
 
-  // Guard: getPlayerInfo may return BAD_DATA for new players with no contract interaction
-  let tier = 0;
-  let ownedFlags = [];
-  let storeItems = [];
-  try {
-    const result = await smartStore.getPlayerInfo(playerAddress);
-    tier       = Number(result[1]);
-    ownedFlags = Array.from(result[2]);
-    storeItems = await smartStore.getActiveItems();
-  } catch (e) {
-    console.warn(`[Blockchain] getPlayerInfo fallback for ${playerAddress}: ${e.message}`);
-    // New player — no contract state yet, return empty defaults
-  }
+  // Get player's owned items
+  const ownedItemIds = await smartStore.getPlayerItems(playerAddress);
 
-  const rewardPool = await rewardEngine.getRewardPoolBalance();
-
-  // Build ownedItemIds — list of string itemIds the player owns
-  const ownedItemIds = ownedFlags
-    .map((owned, i) => owned ? (ITEM_ID_MAP[Number(storeItems[i]?.id)] || `item_${i + 1}`) : null)
-    .filter(Boolean);
+  // Build ownedItemIds as string array
+  const ownedItems = ownedItemIds.map((id) => ({
+    itemId: Number(id),
+    itemIdStr: ITEM_ID_MAP[Number(id)] || `item_${id}`,
+  }));
 
   return {
-    address:       playerAddress,
-    ethBalance:    ethers.formatEther(ethBalance),
-    tier,
-    ownedItemIds,
-    ownedItems:    ownedFlags.map((owned, i) => ({
-      itemId: Number(storeItems[i]?.id || i + 1),
-      owned,
-    })),
-    rewardPoolETH: fromWei(rewardPool),
-    network:       "Sepolia",
-    explorerUrl:   `https://sepolia.etherscan.io/address/${playerAddress}`,
+    address: playerAddress,
+    ethBalance: ethers.formatEther(ethBalance),
+    ownedItemIds: ownedItems.map((i) => i.itemIdStr),
+    ownedItems,
+    network: "Sepolia",
+    explorerUrl: `https://sepolia.etherscan.io/address/${playerAddress}`,
   };
 }
 
-// E. Get store items
-// FIX: added itemId (string), numericId, priceETHFormatted, active fields
+// Get single item details
+async function getItem(itemId) {
+  const item = await smartStore.getItem(itemId);
+  if (!item || item.id === 0) throw new Error("Item not found");
+  
+  return {
+    itemId: Number(item.id),
+    itemIdStr: ITEM_ID_MAP[Number(item.id)] || `item_${item.id}`,
+    name: item.name,
+    price: fromWei(item.price),
+    priceWei: item.price.toString(),
+    isAvailable: item.isAvailable,
+  };
+}
+
+// Get all store items
 async function getStoreItems() {
-  const items = await smartStore.getActiveItems();
-  return items.map(item => {
+  const items = await smartStore.getAllItems();
+  return items.map((item) => {
     const numericId = Number(item.id);
     return {
-      itemId:            ITEM_ID_MAP[numericId] || `item_${numericId}`,
+      itemId: ITEM_ID_MAP[numericId] || `item_${numericId}`,
       numericId,
-      name:              item.name,
-      itemType:          item.itemType,
-      priceETH:          fromWei(item.priceETH),
-      priceETHFormatted: fromWei(item.priceETH).toFixed(4),
-      pricePHP:          Number(item.pricePHP) / 100,
-      tier:              Number(item.tier),
-      active:            true,
+      name: item.name,
+      price: fromWei(item.price),
+      priceWei: item.price.toString(),
+      isAvailable: item.isAvailable,
     };
   });
 }
 
-// F. Deposit to reward pool
-async function depositRewardPool(amountETH) {
-  const tx = await rewardEngine.depositRewardPool({ value: toWei(amountETH) });
-  const receipt = await waitForTx(tx, "DepositRewardPool");
-  return { txHash: receipt.hash, amountETH,
-    explorerUrl: `https://sepolia.etherscan.io/tx/${receipt.hash}` };
+// Get available store items only
+async function getAvailableStoreItems() {
+  const items = await smartStore.getAvailableItems();
+  return items.map((item) => {
+    const numericId = Number(item.id);
+    return {
+      itemId: ITEM_ID_MAP[numericId] || `item_${numericId}`,
+      numericId,
+      name: item.name,
+      price: fromWei(item.price),
+      priceWei: item.price.toString(),
+      isAvailable: item.isAvailable,
+    };
+  });
 }
 
-// G. Event listeners
+// Get player's owned items
+async function getPlayerItems(playerAddress) {
+  if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
+  
+  const ownedItemIds = await smartStore.getPlayerItems(playerAddress);
+  
+  // Get full item details for each owned item
+  const ownedItems = [];
+  for (const itemId of ownedItemIds) {
+    const item = await smartStore.getItem(itemId);
+    ownedItems.push({
+      itemId: Number(item.id),
+      itemIdStr: ITEM_ID_MAP[Number(item.id)] || `item_${item.id}`,
+      name: item.name,
+      price: fromWei(item.price),
+      priceWei: item.price.toString(),
+      isAvailable: item.isAvailable,
+    });
+  }
+  
+  return ownedItems;
+}
+
+// Check if player owns a specific item
+async function hasPlayerBoughtItem(playerAddress, itemId) {
+  if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
+  return await smartStore.hasPlayerBoughtItem(playerAddress, itemId);
+}
+
+// ==================== EVENT LISTENERS ====================
+
 function startEventListeners(io) {
-  rewardEngine.on("RewardSent", (player, amount, reason, ts, event) => {
-    console.log(`🏆 Reward: ${player} +${fromWei(amount)} ETH | ${reason}`);
-    if (io) io.to(player.toLowerCase()).emit("reward",
-      { amountETH: fromWei(amount), reason, txHash: event.log.transactionHash });
+  smartStore.on("ItemCreated", (itemId, name, price, event) => {
+    console.log(`🆕 Item Created: ID ${itemId} - ${name} (${fromWei(price)} ETH)`);
+    if (io) io.emit("itemCreated", { itemId: Number(itemId), name, priceETH: fromWei(price), txHash: event.log.transactionHash });
   });
-  rewardEngine.on("FiatPurchaseProcessed", (player, fiatAmt, prov, refId, ts, event) => {
-    console.log(`💳 Fiat: ${player} | ₱${fiatAmt / 100} | ${prov}`);
-    if (io) io.to(player.toLowerCase()).emit("fiatProcessed",
-      { provider: prov, referenceId: refId, txHash: event.log.transactionHash });
+
+  smartStore.on("ItemPriceUpdated", (itemId, newPrice, event) => {
+    console.log(`💰 Price Updated: Item ${itemId} - ${fromWei(newPrice)} ETH`);
+    if (io) io.emit("itemPriceUpdated", { itemId: Number(itemId), priceETH: fromWei(newPrice), txHash: event.log.transactionHash });
   });
-  smartStore.on("ItemPurchased", (player, itemId, itemType, price, ts, event) => {
+
+  smartStore.on("ItemAvailabilityToggled", (itemId, isAvailable, event) => {
+    console.log(`🔄 Availability Toggled: Item ${itemId} - ${isAvailable ? "Available" : "Unavailable"}`);
+    if (io) io.emit("itemAvailabilityToggled", { itemId: Number(itemId), isAvailable, txHash: event.log.transactionHash });
+  });
+
+  smartStore.on("ItemPurchased", (player, itemId, price, timestamp, event) => {
     console.log(`🛒 Purchase: ${player} item ${itemId} — ${fromWei(price)} ETH`);
-    if (io) io.to(player.toLowerCase()).emit("itemPurchased",
-      { itemId: Number(itemId), itemType, priceETH: fromWei(price), txHash: event.log.transactionHash });
+    if (io) io.to(player.toLowerCase()).emit("itemPurchased", { itemId: Number(itemId), priceETH: fromWei(price), txHash: event.log.transactionHash });
   });
+
   console.log("📡 Blockchain event listeners active on Sepolia");
 }
 
-module.exports = { rewardPlayer, processFiatPurchase, prepareStorePurchaseTx,
-  getPlayerInfo, getStoreItems, depositRewardPool, startEventListeners, provider, toWei, fromWei };
+module.exports = {
+  // Admin functions
+  createItem,
+  setItemPrice,
+  toggleItemAvailability,
+  updateItem,
+  setTreasury,
+  // Player functions
+  prepareStorePurchaseTx,
+  getPlayerInfo,
+  getItem,
+  getStoreItems,
+  getAvailableStoreItems,
+  getPlayerItems,
+  hasPlayerBoughtItem,
+  // Utilities
+  startEventListeners,
+  provider,
+  toWei,
+  fromWei,
+};
