@@ -261,6 +261,86 @@ async function hasPlayerBoughtItem(playerAddress, itemId) {
   return await smartStore.hasPlayerBoughtItem(playerAddress, itemId);
 }
 
+// ==================== TRANSACTION HELPERS ====================
+
+// Wait for transaction receipt with configurable confirmations and timeout
+async function waitForTransaction(txHash, confirmations = 1, timeoutMs = 60000) {
+  try {
+    const receipt = await provider.waitForTransaction(txHash, confirmations, timeoutMs);
+    return {
+      txHash: receipt.hash,
+      status: receipt.status,
+      blockNumber: receipt.blockNumber,
+      blockHash: receipt.blockHash,
+      gasUsed: receipt.gasUsed?.toString(),
+      confirmations: receipt.confirmations,
+      from: receipt.from,
+      to: receipt.to,
+      logs: receipt.logs,
+    };
+  } catch (error) {
+    console.error(`Error waiting for transaction ${txHash}:`, error.message);
+    throw error;
+  }
+}
+
+// Get transaction receipt without waiting (returns null if pending/not found)
+async function getTransactionReceipt(txHash) {
+  try {
+    const receipt = await provider.getTransactionReceipt(txHash);
+    if (!receipt) {
+      return null;
+    }
+    return {
+      txHash: receipt.hash,
+      status: receipt.status,
+      blockNumber: receipt.blockNumber,
+      blockHash: receipt.blockHash,
+      gasUsed: receipt.gasUsed?.toString(),
+      confirmations: receipt.confirmations,
+      from: receipt.from,
+      to: receipt.to,
+    };
+  } catch (error) {
+    console.error(`Error getting transaction receipt for ${txHash}:`, error.message);
+    throw error;
+  }
+}
+
+// Get raw transaction data for verification
+async function getTransaction(txHash) {
+  try {
+    const tx = await provider.getTransaction(txHash);
+    if (!tx) {
+      return null;
+    }
+    return {
+      hash: tx.hash,
+      from: tx.from,
+      to: tx.to,
+      value: tx.value?.toString(),
+      gasLimit: tx.gasLimit?.toString(),
+      gasPrice: tx.gasPrice?.toString(),
+      nonce: tx.nonce,
+      chainId: tx.chainId,
+      data: tx.data,
+    };
+  } catch (error) {
+    console.error(`Error getting transaction ${txHash}:`, error.message);
+    throw error;
+  }
+}
+
+// Get current block number for confirmation counting
+async function getCurrentBlockNumber() {
+  try {
+    return await provider.getBlockNumber();
+  } catch (error) {
+    console.error("Error getting current block number:", error.message);
+    throw error;
+  }
+}
+
 // ==================== EVENT LISTENERS ====================
 
 function startEventListeners(io) {
@@ -304,6 +384,12 @@ module.exports = {
   hasPlayerBoughtItem,
   // Utilities
   startEventListeners,
+  // Transaction helpers
+  waitForTransaction,
+  getTransactionReceipt,
+  getTransaction,
+  getCurrentBlockNumber,
+  // Provider & conversion
   provider,
   toWei,
   fromWei,

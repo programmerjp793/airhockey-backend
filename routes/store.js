@@ -12,6 +12,7 @@
 //   GET /api/store/items - Get all items
 //   GET /api/store/items/available - Get available items
 //   GET /api/store/items/:itemId - Get single item
+//   GET /api/store/owned - Get authenticated player's owned items
 //   GET /api/store/player/:playerAddress/items - Get player's owned items
 //   GET /api/store/player/:playerAddress/items/:itemId/owns - Check if player owns item
 
@@ -262,6 +263,56 @@ router.get('/items/:itemId', async (req, res, next) => {
 });
 
 // GET /api/store/items/available - Get available items only (must be AFTER /items/:itemId to avoid conflict)
+
+// GET /api/store/owned - Get authenticated player's owned items (for StoreManager.cs line 439)
+router.get('/owned', async (req, res, next) => {
+  try {
+    let playerAddress = null;
+
+    // Try to get player from auth header
+    if (req.headers.authorization) {
+      try {
+        const authService = require('../services/unityAuthService');
+        const player = await authService.verifyToken(req.headers.authorization.replace("Bearer ", ""));
+        if (player) {
+          playerAddress = player.walletAddress;
+        }
+      } catch (e) {
+        // Auth failed, continue
+      }
+    }
+
+    // If still no player address, try query param or header
+    if (!playerAddress) {
+      playerAddress = req.query.walletAddress || req.headers['x-wallet-address'];
+    }
+
+    if (!playerAddress) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Wallet address is required. Provide via auth token, query param (walletAddress), or header (x-wallet-address)' 
+      });
+    }
+
+    playerAddress = playerAddress.toLowerCase();
+    console.log(`[Store] GET /owned for wallet: ${playerAddress}`);
+
+    const ownedItems = await blockchainService.getPlayerItems(playerAddress);
+
+    // Convert to string array for response
+    const ownedItemIds = ownedItems.map(item => item.itemIdStr || item.itemId?.toString());
+
+    return res.json({
+      success: true,
+      ownedItems: ownedItemIds,
+      count: ownedItemIds.length,
+    });
+
+  } catch (err) {
+    console.error('[Store] GET /owned error:', err.message);
+    next(err);
+  }
+});
 
 // GET /api/store/player/:playerAddress/items - Get player's owned items
 router.get('/player/:playerAddress/items', async (req, res, next) => {
