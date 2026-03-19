@@ -37,6 +37,26 @@ app.use("/api/store",   storeRoutes);   // SmartStore item listing + admin manag
 app.use("/api/purchase", paymentRoutes); // Item purchase flow (prepare, confirm)
 app.use("/api/wallet",  walletRoutes);  // Player wallet info + token balance
 
+// ─── Root Route ───────────────────────────────────────────────────────────────
+// Root route - handles GET / and HEAD /
+app.get("/", (req, res) => {
+  res.json({ 
+    status: "ok", 
+    message: "Air Hockey Backend API is running",
+    version: "1.0.0",
+    endpoints: [
+      "/api/auth/unity-login",
+      "/api/auth/wallet-login", 
+      "/api/purchase/prepare-store-tx",
+      "/api/purchase/submit-tx",
+      "/api/purchase/status",
+      "/api/store/items",
+      "/api/wallet/info",
+      "/health"
+    ]
+  });
+});
+
 // ─── Health Check ─────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) =>
   res.json({ status: "ok", timestamp: new Date().toISOString() })
