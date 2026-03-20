@@ -137,9 +137,11 @@ async function prepareStorePurchaseTx(playerAddress, itemId) {
   const valueWei = item.price.toString();
   const gasLimit = ((gasEst * 120n) / 100n).toString();
 
-  // FIX: MetaMask Mobile deep link format:
-  // metamask://send/{contractAddress}@{chainId}?value={wei}&data={calldata}&gasLimit={gas}
-  const deepLink = `metamask://send/${storeAddress}@11155111?value=${valueWei}&data=${callData}&gasLimit=${gasLimit}`;
+  // FIX: MetaMask Mobile deep link format with redirectUrl so MetaMask returns to the app
+  // after the user signs the transaction. The redirect carries the txHash back via
+  // airhockey://tx-callback?hash=<txHash> which is handled in WalletManager.OnDeepLinkActivated.
+  const redirectUrl = encodeURIComponent("airhockey://tx-callback");
+  const deepLink = `metamask://send/${storeAddress}@11155111?value=${valueWei}&data=${callData}&gasLimit=${gasLimit}&redirectUrl=${redirectUrl}`;
 
   return {
     needsApproval: false,
@@ -151,6 +153,10 @@ async function prepareStorePurchaseTx(playerAddress, itemId) {
     itemName: item.name,
     priceETH: fromWei(item.price),
     priceETHWei: valueWei,
+    // expectedPrice / expectedPriceWei are the canonical fields used by Unity
+    // to verify the amount before signing (matches the full-flow spec).
+    expectedPrice: fromWei(item.price),
+    expectedPriceWei: valueWei,
     isAvailable: item.isAvailable,
     deepLink,
     gasLimit,
