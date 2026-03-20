@@ -40,17 +40,24 @@ app.use("/api/wallet",  walletRoutes);  // Player wallet info + token balance
 // ─── Root Route ───────────────────────────────────────────────────────────────
 // Root route - handles GET / and HEAD /
 app.get("/", (req, res) => {
-  res.json({ 
-    status: "ok", 
+  res.json({
+    status: "ok",
     message: "Air Hockey Backend API is running",
     version: "1.0.0",
     endpoints: [
       "/api/auth/unity-login",
-      "/api/auth/wallet-login", 
+      "/api/auth/wallet-login",
+      "/api/store/items",
+      "/api/store/owned",
+      "/api/purchase/prepare",
       "/api/purchase/prepare-store-tx",
+      "/api/purchase/create-intent",
       "/api/purchase/submit-tx",
       "/api/purchase/status",
-      "/api/store/items",
+      "/api/purchase/status/:intentId",
+      "/api/purchase/confirm",
+      "/api/purchase/check-ownership",
+      "/api/wallet/balance",
       "/api/wallet/info",
       "/health"
     ]
