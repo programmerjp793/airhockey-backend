@@ -129,7 +129,7 @@ async function prepareStorePurchaseTx(playerAddress, itemId) {
   const gasEst = await smartStore.buyItem.estimateGas(itemId, { from: playerAddress, value: item.price }).catch(() => BigInt(120000));
 
   // buyItem(uint256) 4-byte selector + encoded itemId
-  const selector = "0xd38ea5bf"; // keccak256("buyItem(uint256)").slice(0,4)
+  const selector = "0xe7fb74c7"; // FIX: was 0xd38ea5bf which is incorrect
   const encodedId = BigInt(itemId).toString(16).padStart(64, "0");
   const callData = selector + encodedId;
 
