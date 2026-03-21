@@ -20,6 +20,7 @@ const express = require('express');
 const router = express.Router();
 const authenticate = require('../middleware/authenticate');
 const blockchainService = require('../services/blockchainService');
+const transactionService = require('../services/transactionService');
 
 // ==================== ADMIN ENDPOINTS ====================
 // All admin endpoints require authentication
@@ -43,6 +44,30 @@ router.post('/items', authenticate, async (req, res, next) => {
     }
 
     const result = await blockchainService.createItem(name, priceETH, isAvailable);
+
+    // Record admin action in transactions DB (optional, for audit)
+    try {
+      await transactionService.recordTransaction({
+        transactionHash: result.txHash,
+        playerId: req.player._id,
+        playerAddress: req.player.walletAddress,
+        itemId: 0,
+        itemName: name,
+        priceETH: String(priceETH),
+        priceWei: blockchainService.toWei(priceETH).toString(),
+        status: 'confirmed',
+        chainId: 11155111,
+        contractAddress: process.env.SMART_STORE_ADDRESS,
+        methodName: 'createItem',
+        type: 'admin_action',
+        metadata: {
+          isAvailable,
+          name,
+        },
+      });
+    } catch (txErr) {
+      console.warn('[Store] Admin action transaction record failed:', txErr.message);
+    }
 
     return res.status(201).json({
       success: true,
@@ -77,6 +102,29 @@ router.put('/items/:itemId/price', authenticate, async (req, res, next) => {
 
     const result = await blockchainService.setItemPrice(numericItemId, priceETH);
 
+    try {
+      await transactionService.recordTransaction({
+        transactionHash: result.txHash,
+        playerId: req.player._id,
+        playerAddress: req.player.walletAddress,
+        itemId: numericItemId,
+        itemName: `item_${numericItemId}`,
+        priceETH: String(priceETH),
+        priceWei: blockchainService.toWei(priceETH).toString(),
+        status: 'confirmed',
+        chainId: 11155111,
+        contractAddress: process.env.SMART_STORE_ADDRESS,
+        methodName: 'setItemPrice',
+        type: 'admin_action',
+        metadata: {
+          itemId: numericItemId,
+          priceETH,
+        },
+      });
+    } catch (txErr) {
+      console.warn('[Store] Admin action transaction record failed:', txErr.message);
+    }
+
     return res.json({
       success: true,
       message: 'Item price updated successfully',
@@ -104,6 +152,29 @@ router.put('/items/:itemId/availability', authenticate, async (req, res, next) =
     }
 
     const result = await blockchainService.toggleItemAvailability(numericItemId);
+
+    try {
+      await transactionService.recordTransaction({
+        transactionHash: result.txHash,
+        playerId: req.player._id,
+        playerAddress: req.player.walletAddress,
+        itemId: numericItemId,
+        itemName: `item_${numericItemId}`,
+        priceETH: '0',
+        priceWei: '0',
+        status: 'confirmed',
+        chainId: 11155111,
+        contractAddress: process.env.SMART_STORE_ADDRESS,
+        methodName: 'toggleItemAvailability',
+        type: 'admin_action',
+        metadata: {
+          itemId: numericItemId,
+          available: result.isAvailable,
+        },
+      });
+    } catch (txErr) {
+      console.warn('[Store] Admin action transaction record failed:', txErr.message);
+    }
 
     return res.json({
       success: true,
@@ -151,6 +222,28 @@ router.put('/items/:itemId', authenticate, async (req, res, next) => {
       isAvailable !== undefined ? isAvailable : currentItem.isAvailable
     );
 
+    try {
+      await transactionService.recordTransaction({
+        transactionHash: result.txHash,
+        playerId: req.player._id,
+        playerAddress: req.player.walletAddress,
+        itemId: numericItemId,
+        itemName: name || currentItem.name,
+        priceETH: priceETH !== undefined ? String(priceETH) : String(currentItem.price),
+        priceWei: priceETH !== undefined ? blockchainService.toWei(priceETH).toString() : currentItem.priceWei || '0',
+        status: 'confirmed',
+        chainId: 11155111,
+        contractAddress: process.env.SMART_STORE_ADDRESS,
+        methodName: 'updateItem',
+        type: 'admin_action',
+        metadata: {
+          isAvailable: isAvailable !== undefined ? isAvailable : currentItem.isAvailable,
+        },
+      });
+    } catch (txErr) {
+      console.warn('[Store] Admin action transaction record failed:', txErr.message);
+    }
+
     return res.json({
       success: true,
       message: 'Item updated successfully',
@@ -177,6 +270,28 @@ router.post('/treasury', authenticate, async (req, res, next) => {
     }
 
     const result = await blockchainService.setTreasury(treasuryAddress);
+
+    try {
+      await transactionService.recordTransaction({
+        transactionHash: result.txHash,
+        playerId: req.player._id,
+        playerAddress: req.player.walletAddress,
+        itemId: 0,
+        itemName: 'treasury_update',
+        priceETH: '0',
+        priceWei: '0',
+        status: 'confirmed',
+        chainId: 11155111,
+        contractAddress: process.env.SMART_STORE_ADDRESS,
+        methodName: 'setTreasury',
+        type: 'admin_action',
+        metadata: {
+          treasuryAddress,
+        },
+      });
+    } catch (txErr) {
+      console.warn('[Store] Admin action transaction record failed:', txErr.message);
+    }
 
     return res.json({
       success: true,

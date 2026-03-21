@@ -14,6 +14,7 @@ const crypto = require("crypto");
 
 const Player = require("../models/Player");
 const blockchainService = require("../services/blockchainService");
+const transactionService = require("../services/transactionService");
 
 const router = express.Router();
 
@@ -305,6 +306,44 @@ router.post(
       }
 
       if (!receipt || receipt.status !== 1) {
+        // Record failed transaction
+        try {
+          const player = await Player.findOne({ walletAddress: playerAddress });
+          if (player) {
+            const item = await blockchainService.getItem(numericId);
+            await transactionService.recordTransaction({
+              transactionHash: txHash,
+              playerId: player._id,
+              playerAddress,
+              itemId: numericId,
+              itemName: item?.name || 'Unknown Item',
+              priceETH: item ? blockchainService.fromWei(item.price) : '0',
+              priceWei: item ? item.price.toString() : '0',
+              status: 'failed',
+              chainId: 11155111,
+              contractAddress: process.env.SMART_STORE_ADDRESS,
+              methodName: 'buyItem',
+              type: 'purchase',
+              metadata: {
+                blockNumber: receipt?.blockNumber,
+                reason: 'Transaction failed on blockchain',
+              },
+            });
+
+            if (receipt?.blockNumber) {
+              await transactionService.confirmTransaction(txHash, {
+                blockNumber: receipt.blockNumber,
+                gasUsed: receipt.gasUsed?.toString(),
+                gasPrice: receipt.gasPrice?.toString(),
+              });
+            }
+
+            await transactionService.failTransaction(txHash, 'Transaction failed on blockchain');
+          }
+        } catch (txErr) {
+          console.error(`[Purchase] Failed to record failed transaction:`, txErr.message);
+        }
+
         return res.status(400).json({
           success: false,
           message: "Transaction failed on blockchain",
@@ -330,9 +369,11 @@ router.post(
       const stringItemId = NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`;
 
       let playerUpdated = false;
+      let playerId = null;
       try {
         const player = await Player.findOne({ walletAddress: playerAddress });
         if (player) {
+          playerId = player._id;
           if (!player.ownedItems.includes(stringItemId)) {
             player.ownedItems.push(stringItemId);
             await player.save();
@@ -342,6 +383,42 @@ router.post(
         }
       } catch (dbErr) {
         console.error(`[Purchase] Database update error:`, dbErr.message);
+      }
+
+      // Record transaction in MongoDB
+      if (playerId) {
+        try {
+          await transactionService.recordTransaction({
+            transactionHash: txHash,
+            playerId,
+            playerAddress,
+            itemId: numericId,
+            itemName: item.name,
+            priceETH: blockchainService.fromWei(item.price),
+            priceWei: item.price.toString(),
+            status: 'pending',
+            chainId: 11155111,
+            contractAddress: process.env.SMART_STORE_ADDRESS,
+            methodName: 'buyItem',
+            type: 'purchase',
+            metadata: {
+              stringItemId,
+              receiptBlockNumber: receipt.blockNumber,
+            },
+          });
+
+          // Confirm the transaction with block details
+          await transactionService.confirmTransaction(txHash, {
+            blockNumber: receipt.blockNumber,
+            gasUsed: receipt.gasUsed.toString(),
+            gasPrice: receipt.gasPrice.toString(),
+          });
+
+          console.log(`[Purchase] Transaction recorded: ${txHash}`);
+        } catch (txErr) {
+          console.error(`[Purchase] Failed to record transaction:`, txErr.message);
+          // Don't fail the purchase if transaction recording fails
+        }
       }
 
       return res.json({

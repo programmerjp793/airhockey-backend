@@ -1,13 +1,16 @@
 // services/blockchainService.js — Native ETH only, for new SmartStore.sol
-
 const { ethers } = require("ethers");
 require("dotenv").config();
 
+// FIX: Hardhat artifacts store the ABI nested under a .abi property.
+// Extract it — ethers.Contract() needs a plain array, not the full artifact object.
 const SmartStoreArtifact = require("../abis/SmartStore.json");
+
 const SmartStoreABI = SmartStoreArtifact.abi ?? SmartStoreArtifact;
 
 const provider = new ethers.JsonRpcProvider(process.env.SEPOLIA_RPC_URL);
 
+// Use provider for read-only operations, wallet only when private key is available
 let signer = provider;
 if (process.env.BACKEND_SIGNER_PRIVATE_KEY) {
   signer = new ethers.Wallet(process.env.BACKEND_SIGNER_PRIVATE_KEY, provider);
@@ -15,9 +18,11 @@ if (process.env.BACKEND_SIGNER_PRIVATE_KEY) {
 
 const smartStore = new ethers.Contract(process.env.SMART_STORE_ADDRESS, SmartStoreABI, signer);
 
-const toWei  = (eth) => ethers.parseEther(String(eth));
+// Wei conversion functions
+const toWei = (eth) => ethers.parseEther(String(eth));
 const fromWei = (wei) => parseFloat(ethers.formatEther(wei));
 
+// Maps numeric contract ID → string itemId used by Unity/backend
 const ITEM_ID_MAP = {
   1: "wallet_upgrade_1",
   2: "wallet_upgrade_2",
@@ -34,6 +39,7 @@ async function waitForTx(tx, label) {
 
 // ==================== ADMIN FUNCTIONS ====================
 
+// Create a new item in the store
 async function createItem(name, priceETH, isAvailable) {
   const priceWei = toWei(priceETH);
   const tx = await smartStore.createItem(name, priceWei, isAvailable);
@@ -47,6 +53,7 @@ async function createItem(name, priceETH, isAvailable) {
   };
 }
 
+// Set item price
 async function setItemPrice(itemId, priceETH) {
   const priceWei = toWei(priceETH);
   const tx = await smartStore.setItemPrice(itemId, priceWei);
@@ -59,6 +66,7 @@ async function setItemPrice(itemId, priceETH) {
   };
 }
 
+// Toggle item availability
 async function toggleItemAvailability(itemId) {
   const tx = await smartStore.toggleItemAvailability(itemId);
   const receipt = await waitForTx(tx, "ToggleItemAvailability");
@@ -69,6 +77,7 @@ async function toggleItemAvailability(itemId) {
   };
 }
 
+// Update multiple item properties at once
 async function updateItem(itemId, name, priceETH, isAvailable) {
   const priceWei = priceETH > 0 ? toWei(priceETH) : 0;
   const tx = await smartStore.updateItem(itemId, name, priceWei, isAvailable);
@@ -83,6 +92,7 @@ async function updateItem(itemId, name, priceETH, isAvailable) {
   };
 }
 
+// Set treasury address
 async function setTreasury(treasuryAddress) {
   if (!ethers.isAddress(treasuryAddress)) throw new Error("Invalid treasury address");
   const tx = await smartStore.setTreasury(treasuryAddress);
@@ -96,12 +106,13 @@ async function setTreasury(treasuryAddress) {
 
 // ==================== PLAYER FUNCTIONS ====================
 
+// Prepare store purchase TX data for MetaMask Mobile deep link
 async function prepareStorePurchaseTx(playerAddress, itemId) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
 
   // Get item details
   const item = await smartStore.getItem(itemId);
-  if (!item || item.id === 0n) throw new Error("Item not found");
+  if (!item || item.id === 0) throw new Error("Item not found");
   if (!item.isAvailable) throw new Error("Item not available");
 
   // Check if player already owns the item
@@ -111,163 +122,146 @@ async function prepareStorePurchaseTx(playerAddress, itemId) {
   // Check player balance
   const playerBal = await provider.getBalance(playerAddress);
   if (playerBal < item.price) {
-    throw new Error(`Insufficient ETH. Need ${fromWei(item.price)} ETH, have ${fromWei(playerBal)} ETH`);
+    throw new Error(`Insufficient ETH. Need ${fromWei(item.price)}, have ${fromWei(playerBal)}`);
   }
 
-  // FIX: Validate treasury address before building deep link
-  // If treasury is address(0) the contract will always revert on ETH transfer
-  const treasuryAddress = await smartStore.treasury();
-  if (!treasuryAddress || treasuryAddress === ethers.ZeroAddress) {
-    throw new Error("Treasury address not set on contract. Contact admin.");
-  }
-  console.log(`[blockchain] Treasury: ${treasuryAddress}`);
+  const feeData = await provider.getFeeData();
+  const gasEst = await smartStore.buyItem.estimateGas(itemId, { from: playerAddress, value: item.price }).catch(() => BigInt(120000));
 
-  // Estimate gas — fall back to 150000 if estimation fails
-  let gasEst;
-  try {
-    gasEst = await smartStore.buyItem.estimateGas(itemId, {
-      from:  playerAddress,
-      value: item.price,
-    });
-    console.log(`[blockchain] Gas estimate: ${gasEst}`);
-  } catch (gasErr) {
-    console.warn(`[blockchain] Gas estimation failed (${gasErr.message}), using fallback 150000`);
-    gasEst = BigInt(150000);
-  }
-
-  // FIX: Correct selector — confirmed from ABI and deployed bytecode
-  // keccak256("buyItem(uint256)") = 0xe7fb74c7
-  const selector  = "0xe7fb74c7";
+  // buyItem(uint256) 4-byte selector + encoded itemId
+  const selector = "0xe7fb74c7"; // FIX: was 0xd38ea5bf which is incorrect
   const encodedId = BigInt(itemId).toString(16).padStart(64, "0");
-  const callData  = selector + encodedId;
+  const callData = selector + encodedId;
 
   const storeAddress = process.env.SMART_STORE_ADDRESS;
-  const valueWei     = item.price.toString();
-  const gasLimit     = ((gasEst * 130n) / 100n).toString(); // 30% buffer
+  const valueWei = item.price.toString();
+  const gasLimit = ((gasEst * 120n) / 100n).toString();
 
-  // FIX: Use https://metamask.app.link/send/ format instead of metamask://send/
-  //
-  // metamask://send/ is a legacy scheme that does NOT reliably support:
-  //   - contract call data (the `data` param)
-  //   - redirectUrl callbacks
-  //
-  // https://metamask.app.link/send/ is the officially supported universal link
-  // that correctly handles contract interactions and works on both iOS and Android.
-  //
-  // The redirectUrl is embedded so MetaMask returns to the app after signing
-  // via airhockey://tx-callback?hash=<txHash>
+  // FIX: MetaMask Mobile deep link format with redirectUrl so MetaMask returns to the app
+  // after the user signs the transaction. The redirect carries the txHash back via
+  // airhockey://tx-callback?hash=<txHash> which is handled in WalletManager.OnDeepLinkActivated.
   const redirectUrl = encodeURIComponent("airhockey://tx-callback");
-  const deepLink = `https://metamask.app.link/send/${storeAddress}@11155111?value=${valueWei}&data=${callData}&gasLimit=${gasLimit}&redirectUrl=${redirectUrl}`;
-
-  console.log(`[blockchain] Deep link: ${deepLink}`);
+  const deepLink = `metamask://send/${storeAddress}@11155111?value=${valueWei}&data=${callData}&gasLimit=${gasLimit}&redirectUrl=${redirectUrl}`;
 
   return {
-    success:          true,
-    needsApproval:    false,
-    step:             "purchase",
+    needsApproval: false,
+    step: "purchase",
     storeAddress,
-    chainId:          11155111,
-    chainIdHex:       "0xaa36a7",
-    itemId:           Number(item.id),
-    itemName:         item.name,
-    priceETH:         fromWei(item.price),
-    priceETHWei:      valueWei,
-    expectedPrice:    fromWei(item.price),
+    chainId: 11155111,
+    chainIdHex: "0xaa36a7",
+    itemId: Number(item.id),
+    itemName: item.name,
+    priceETH: fromWei(item.price),
+    priceETHWei: valueWei,
+    // expectedPrice / expectedPriceWei are the canonical fields used by Unity
+    // to verify the amount before signing (matches the full-flow spec).
+    expectedPrice: fromWei(item.price),
     expectedPriceWei: valueWei,
-    isAvailable:      item.isAvailable,
+    isAvailable: item.isAvailable,
     deepLink,
     gasLimit,
-    explorerBase:     "https://sepolia.etherscan.io",
-    message:          `Sign to purchase: ${item.name} (${fromWei(item.price)} ETH)`,
+    maxFeePerGas: feeData.maxFeePerGas?.toString(),
+    explorerBase: "https://sepolia.etherscan.io",
+    message: `Sign to purchase: ${item.name} (${fromWei(item.price)} ETH)`,
   };
 }
 
+// Get player info
 async function getPlayerInfo(playerAddress) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid address");
 
-  const ethBalance  = await provider.getBalance(playerAddress);
+  const ethBalance = await provider.getBalance(playerAddress);
+
+  // Get player's owned items
   const ownedItemIds = await smartStore.getPlayerItems(playerAddress);
 
+  // Build ownedItemIds as string array
   const ownedItems = ownedItemIds.map((id) => ({
-    itemId:    Number(id),
+    itemId: Number(id),
     itemIdStr: ITEM_ID_MAP[Number(id)] || `item_${id}`,
   }));
 
   return {
-    address:      playerAddress,
-    ethBalance:   ethers.formatEther(ethBalance),
+    address: playerAddress,
+    ethBalance: ethers.formatEther(ethBalance),
     ownedItemIds: ownedItems.map((i) => i.itemIdStr),
     ownedItems,
-    network:      "Sepolia",
-    explorerUrl:  `https://sepolia.etherscan.io/address/${playerAddress}`,
+    network: "Sepolia",
+    explorerUrl: `https://sepolia.etherscan.io/address/${playerAddress}`,
   };
 }
 
+// Get single item details
 async function getItem(itemId) {
   const item = await smartStore.getItem(itemId);
-  if (!item || item.id === 0n) throw new Error("Item not found");
-
+  if (!item || item.id === 0) throw new Error("Item not found");
+  
   return {
-    itemId:      Number(item.id),
-    itemIdStr:   ITEM_ID_MAP[Number(item.id)] || `item_${item.id}`,
-    name:        item.name,
-    price:       fromWei(item.price),
-    priceWei:    item.price.toString(),
+    itemId: Number(item.id),
+    itemIdStr: ITEM_ID_MAP[Number(item.id)] || `item_${item.id}`,
+    name: item.name,
+    price: fromWei(item.price),
+    priceWei: item.price.toString(),
     isAvailable: item.isAvailable,
   };
 }
 
+// Get all store items
 async function getStoreItems() {
   const items = await smartStore.getAllItems();
   return items.map((item) => {
     const numericId = Number(item.id);
     return {
-      itemId:      ITEM_ID_MAP[numericId] || `item_${numericId}`,
+      itemId: ITEM_ID_MAP[numericId] || `item_${numericId}`,
       numericId,
-      name:        item.name,
-      price:       fromWei(item.price),
-      priceWei:    item.price.toString(),
+      name: item.name,
+      price: fromWei(item.price),
+      priceWei: item.price.toString(),
       isAvailable: item.isAvailable,
     };
   });
 }
 
+// Get available store items only
 async function getAvailableStoreItems() {
   const items = await smartStore.getAvailableItems();
   return items.map((item) => {
     const numericId = Number(item.id);
     return {
-      itemId:      ITEM_ID_MAP[numericId] || `item_${numericId}`,
+      itemId: ITEM_ID_MAP[numericId] || `item_${numericId}`,
       numericId,
-      name:        item.name,
-      price:       fromWei(item.price),
-      priceWei:    item.price.toString(),
+      name: item.name,
+      price: fromWei(item.price),
+      priceWei: item.price.toString(),
       isAvailable: item.isAvailable,
     };
   });
 }
 
+// Get player's owned items
 async function getPlayerItems(playerAddress) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
-
+  
   const ownedItemIds = await smartStore.getPlayerItems(playerAddress);
-  const ownedItems   = [];
-
+  
+  // Get full item details for each owned item
+  const ownedItems = [];
   for (const itemId of ownedItemIds) {
     const item = await smartStore.getItem(itemId);
     ownedItems.push({
-      itemId:      Number(item.id),
-      itemIdStr:   ITEM_ID_MAP[Number(item.id)] || `item_${item.id}`,
-      name:        item.name,
-      price:       fromWei(item.price),
-      priceWei:    item.price.toString(),
+      itemId: Number(item.id),
+      itemIdStr: ITEM_ID_MAP[Number(item.id)] || `item_${item.id}`,
+      name: item.name,
+      price: fromWei(item.price),
+      priceWei: item.price.toString(),
       isAvailable: item.isAvailable,
     });
   }
-
+  
   return ownedItems;
 }
 
+// Check if player owns a specific item
 async function hasPlayerBoughtItem(playerAddress, itemId) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
   return await smartStore.hasPlayerBoughtItem(playerAddress, itemId);
@@ -275,19 +269,20 @@ async function hasPlayerBoughtItem(playerAddress, itemId) {
 
 // ==================== TRANSACTION HELPERS ====================
 
+// Wait for transaction receipt with configurable confirmations and timeout
 async function waitForTransaction(txHash, confirmations = 1, timeoutMs = 60000) {
   try {
     const receipt = await provider.waitForTransaction(txHash, confirmations, timeoutMs);
     return {
-      txHash:       receipt.hash,
-      status:       receipt.status,
-      blockNumber:  receipt.blockNumber,
-      blockHash:    receipt.blockHash,
-      gasUsed:      receipt.gasUsed?.toString(),
+      txHash: receipt.hash,
+      status: receipt.status,
+      blockNumber: receipt.blockNumber,
+      blockHash: receipt.blockHash,
+      gasUsed: receipt.gasUsed?.toString(),
       confirmations: receipt.confirmations,
-      from:         receipt.from,
-      to:           receipt.to,
-      logs:         receipt.logs,
+      from: receipt.from,
+      to: receipt.to,
+      logs: receipt.logs,
     };
   } catch (error) {
     console.error(`Error waiting for transaction ${txHash}:`, error.message);
@@ -295,19 +290,22 @@ async function waitForTransaction(txHash, confirmations = 1, timeoutMs = 60000) 
   }
 }
 
+// Get transaction receipt without waiting (returns null if pending/not found)
 async function getTransactionReceipt(txHash) {
   try {
     const receipt = await provider.getTransactionReceipt(txHash);
-    if (!receipt) return null;
+    if (!receipt) {
+      return null;
+    }
     return {
-      txHash:       receipt.hash,
-      status:       receipt.status,
-      blockNumber:  receipt.blockNumber,
-      blockHash:    receipt.blockHash,
-      gasUsed:      receipt.gasUsed?.toString(),
+      txHash: receipt.hash,
+      status: receipt.status,
+      blockNumber: receipt.blockNumber,
+      blockHash: receipt.blockHash,
+      gasUsed: receipt.gasUsed?.toString(),
       confirmations: receipt.confirmations,
-      from:         receipt.from,
-      to:           receipt.to,
+      from: receipt.from,
+      to: receipt.to,
     };
   } catch (error) {
     console.error(`Error getting transaction receipt for ${txHash}:`, error.message);
@@ -315,20 +313,23 @@ async function getTransactionReceipt(txHash) {
   }
 }
 
+// Get raw transaction data for verification
 async function getTransaction(txHash) {
   try {
     const tx = await provider.getTransaction(txHash);
-    if (!tx) return null;
+    if (!tx) {
+      return null;
+    }
     return {
-      hash:     tx.hash,
-      from:     tx.from,
-      to:       tx.to,
-      value:    tx.value?.toString(),
+      hash: tx.hash,
+      from: tx.from,
+      to: tx.to,
+      value: tx.value?.toString(),
       gasLimit: tx.gasLimit?.toString(),
       gasPrice: tx.gasPrice?.toString(),
-      nonce:    tx.nonce,
-      chainId:  tx.chainId,
-      data:     tx.data,
+      nonce: tx.nonce,
+      chainId: tx.chainId,
+      data: tx.data,
     };
   } catch (error) {
     console.error(`Error getting transaction ${txHash}:`, error.message);
@@ -336,6 +337,7 @@ async function getTransaction(txHash) {
   }
 }
 
+// Get current block number for confirmation counting
 async function getCurrentBlockNumber() {
   try {
     return await provider.getBlockNumber();
@@ -372,11 +374,13 @@ function startEventListeners(io) {
 }
 
 module.exports = {
+  // Admin functions
   createItem,
   setItemPrice,
   toggleItemAvailability,
   updateItem,
   setTreasury,
+  // Player functions
   prepareStorePurchaseTx,
   getPlayerInfo,
   getItem,
@@ -384,11 +388,14 @@ module.exports = {
   getAvailableStoreItems,
   getPlayerItems,
   hasPlayerBoughtItem,
+  // Utilities
   startEventListeners,
+  // Transaction helpers
   waitForTransaction,
   getTransactionReceipt,
   getTransaction,
   getCurrentBlockNumber,
+  // Provider & conversion
   provider,
   toWei,
   fromWei,

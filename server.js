@@ -6,11 +6,12 @@ const helmet   = require("helmet");
 const morgan   = require("morgan");
 const mongoose = require("mongoose");
 
-const authRoutes    = require("./routes/auth");
-const matchRoutes   = require("./routes/match");
-const storeRoutes   = require("./routes/store");
-const paymentRoutes = require("./routes/payment");
-const walletRoutes  = require("./routes/wallet");
+const authRoutes       = require("./routes/auth");
+const matchRoutes      = require("./routes/match");
+const storeRoutes      = require("./routes/store");
+const paymentRoutes    = require("./routes/payment");
+const walletRoutes     = require("./routes/wallet");
+const transactionRoutes = require("./routes/transactions");
 
 const { globalLimiter } = require("./middleware/rateLimiter");
 const { errorHandler }  = require("./middleware/errorHandler");
@@ -31,11 +32,12 @@ app.use(globalLimiter);
 app.use(express.json({ limit: "10kb" }));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
-app.use("/api/auth",    authRoutes);    // Unity Auth → Player login / register
-app.use("/api/match",   matchRoutes);   // Create AI match, submit result
-app.use("/api/store",   storeRoutes);   // SmartStore item listing + admin management
-app.use("/api/purchase", paymentRoutes); // Item purchase flow (prepare, confirm)
-app.use("/api/wallet",  walletRoutes);  // Player wallet info + token balance
+app.use("/api/auth",         authRoutes);      // Unity Auth → Player login / register
+app.use("/api/match",        matchRoutes);     // Create AI match, submit result
+app.use("/api/store",        storeRoutes);     // SmartStore item listing + admin management
+app.use("/api/purchase",     paymentRoutes);   // Item purchase flow (prepare, confirm)
+app.use("/api/wallet",       walletRoutes);    // Player wallet info + token balance
+app.use("/api/transactions", transactionRoutes); // Blockchain transaction history
 
 // ─── Root Route ───────────────────────────────────────────────────────────────
 // Root route - handles GET / and HEAD /
@@ -59,6 +61,11 @@ app.get("/", (req, res) => {
       "/api/purchase/check-ownership",
       "/api/wallet/balance",
       "/api/wallet/info",
+      "/api/transactions/history",
+      "/api/transactions/stats",
+      "/api/transactions/:txHash",
+      "/api/transactions/status/:txHash",
+      "/api/transactions/address/:walletAddress",
       "/health"
     ]
   });

@@ -14,6 +14,7 @@ const express           = require('express');
 const router            = express.Router();
 const authenticate      = require('../middleware/authenticate');
 const blockchainService = require('../services/blockchainService');
+const transactionService = require('../services/transactionService');
 const Player            = require('../models/Player');
 
 const EXPLORER = process.env.BLOCK_EXPLORER_URL || 'https://sepolia.etherscan.io';
@@ -134,30 +135,26 @@ router.get('/info', authenticate, async (req, res, next) => {
 
 router.get('/transactions', authenticate, async (req, res, next) => {
   try {
-    const { Match } = require('../models/Match');
+    let blockchainTransactions = [];
 
-    const matches = await Match.find({
-      playerId: req.player.id,
-      status:   'rewarded',
-    })
-      .sort({ rewardClaimedAt: -1 })
-      .limit(20)
-      .select('matchId rewardAmount rewardTxHash rewardClaimedAt difficulty winner');
-
-    const transactions = matches.map(m => ({
-      matchId:     m.matchId,
-      amount:      m.rewardAmount,
-      txHash:      m.rewardTxHash,
-      explorerUrl: `${EXPLORER}/tx/${m.rewardTxHash}`,  // was amoy.polygonscan.com
-      claimedAt:   m.rewardClaimedAt,
-      difficulty:  m.difficulty,
-      winner:      m.winner,
-    }));
+    try {
+      const player = await Player.findById(req.player.id);
+      if (player) {
+        blockchainTransactions = await transactionService.getPlayerTransactions(player._id, {
+          limit: 50,
+          skip: 0,
+          status: null,
+          type: null,
+        });
+      }
+    } catch (errTx) {
+      console.warn('[Wallet] Could not fetch transaction history:', errTx.message);
+    }
 
     return res.json({
-      success:      true,
-      count:        transactions.length,
-      transactions,
+      success: true,
+      count: blockchainTransactions.length,
+      transactions: blockchainTransactions,
     });
 
   } catch (err) {
