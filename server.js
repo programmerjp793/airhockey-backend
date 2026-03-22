@@ -80,10 +80,17 @@ app.get("/health", (_req, res) =>
 app.use(errorHandler);
 
 // ─── Database + Server Start ─────────────────────────────────────────────────
+// Support explicit override to new Atlas cluster and target DB.
+const mongoUri = process.env.MONGODB_URI_NEW || process.env.MONGODB_URI;
+const mongoDbName = process.env.MONGODB_DB_NAME || "pucksense";
+
 mongoose
-  .connect(process.env.MONGODB_URI)
+  .connect(mongoUri, {
+    dbName: mongoDbName,
+    autoIndex: true,
+  })
   .then(() => {
-    console.log("✅ MongoDB connected");
+    console.log(`✅ MongoDB connected to ${mongoDbName}`);
     app.listen(PORT, () =>
       console.log(`🚀 Backend running on port ${PORT} [${process.env.NODE_ENV}]`)
     );

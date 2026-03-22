@@ -397,6 +397,7 @@ module.exports = {
   getCurrentBlockNumber,
   // Provider & conversion
   provider,
+  smartStore,
   toWei,
   fromWei,
 };
