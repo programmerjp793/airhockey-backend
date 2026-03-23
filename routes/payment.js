@@ -147,10 +147,10 @@ function updatePaymentIntent(intentId, newStatus, txHash, explorerUrl) {
 
 // ==================== ETH PURCHASE FLOW ====================
 
-// POST /api/purchase/prepare
-// Called by WalletManager.PurchaseStoreItem() — returns MetaMask deep link
+// POST /api/purchase/prepare-tx
+// Called by WalletManager.PurchaseStoreItem() — returns transaction data for WalletConnect
 router.post(
-  "/prepare",
+  "/prepare-tx",
   [
     body("itemId").notEmpty(),
     body("walletAddress").optional().isEthereumAddress(),
@@ -195,7 +195,7 @@ router.post(
       }
 
       playerWallet = playerWallet.toLowerCase();
-      console.log(`[Purchase] prepare: wallet=${playerWallet} numericId=${numericId}`);
+      console.log(`[Purchase] prepare-tx: wallet=${playerWallet} numericId=${numericId}`);
 
       const item = await blockchainService.getItem(numericId);
 
@@ -209,7 +209,7 @@ router.post(
         });
       }
 
-      const txData = await blockchainService.prepareStorePurchaseTx(playerWallet, numericId);
+      const txData = await blockchainService.prepareStorePurchaseTxForWalletConnect(playerWallet, numericId);
 
       return res.json({
         success: true,
@@ -219,7 +219,7 @@ router.post(
       });
 
     } catch (err) {
-      console.error("[Purchase] prepare error:", err.message);
+      console.error("[Purchase] prepare-tx error:", err.message);
       return res.status(400).json({ success: false, message: err.message });
     }
   }

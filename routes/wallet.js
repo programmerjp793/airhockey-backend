@@ -26,38 +26,22 @@ const EXPLORER = process.env.BLOCK_EXPLORER_URL || 'https://sepolia.etherscan.io
 router.get('/balance', authenticate, async (req, res, next) => {
   try {
     const player = await Player.findById(req.player.id);
-
-    if (!player) {
-      return res.status(404).json({ success: false, message: 'Player not found.' });
-    }
-
-    if (!player.walletAddress) {
+    if (!player || !player.walletAddress) {
       return res.json({
-        success:          true,
-        walletAddress:    null,
-        balance:          '0',
-        balanceFormatted: '0.0000',
-        symbol:           'ETH',       // was 'TTK'
-        tier:             0,
-        note:             'No wallet linked. Connect MetaMask to see your balance.',
+        success: true,
+        walletAddress: null,
+        balance: '0',
+        note: 'No wallet linked. Connect MetaMask to see your balance.',
       });
     }
-
-    // FIX: was blockchainService.getTokenBalance() — no longer exists.
-    // getPlayerInfo() returns { address, ethBalance, ethBalanceWei, tier, ownedItemIds }
     const info = await blockchainService.getPlayerInfo(player.walletAddress);
-
-    return res.json({
-      success:          true,
-      walletAddress:    player.walletAddress,
-      balance:          info.ethBalanceWei,   // raw wei string
-      balanceFormatted: info.ethBalance,      // e.g. "0.0250" ETH
-      symbol:           'ETH',                // was 'TTK'
-      tier:             info.tier,
+    res.json({
+      success: true,
+      walletAddress: player.walletAddress,
+      balance: info.ethBalance,
+      note: 'Use MetaMask to manage your wallet.',
     });
-
   } catch (err) {
-    console.error('[Wallet] /balance error:', err.message);
     next(err);
   }
 });

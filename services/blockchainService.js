@@ -106,8 +106,8 @@ async function setTreasury(treasuryAddress) {
 
 // ==================== PLAYER FUNCTIONS ====================
 
-// Prepare store purchase TX data for MetaMask Mobile deep link
-async function prepareStorePurchaseTx(playerAddress, itemId) {
+// Prepare store purchase TX data for WalletConnect (returns encoded data, not deep link)
+async function prepareStorePurchaseTxForWalletConnect(playerAddress, itemId) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
 
   // Get item details
@@ -129,19 +129,13 @@ async function prepareStorePurchaseTx(playerAddress, itemId) {
   const gasEst = await smartStore.buyItem.estimateGas(itemId, { from: playerAddress, value: item.price }).catch(() => BigInt(120000));
 
   // buyItem(uint256) 4-byte selector + encoded itemId
-  const selector = "0xe7fb74c7"; // FIX: was 0xd38ea5bf which is incorrect
+  const selector = "0xe7fb74c7"; // buyItem(uint256) function selector
   const encodedId = BigInt(itemId).toString(16).padStart(64, "0");
-  const callData = selector + encodedId;
+  const encodedData = selector + encodedId;
 
   const storeAddress = process.env.SMART_STORE_ADDRESS;
   const valueWei = item.price.toString();
   const gasLimit = ((gasEst * 120n) / 100n).toString();
-
-  // FIX: MetaMask Mobile deep link format with redirectUrl so MetaMask returns to the app
-  // after the user signs the transaction. The redirect carries the txHash back via
-  // airhockey://tx-callback?hash=<txHash> which is handled in WalletManager.OnDeepLinkActivated.
-  const redirectUrl = encodeURIComponent("airhockey://tx-callback");
-  const deepLink = `metamask://send/${storeAddress}@11155111?value=${valueWei}&data=${callData}&gasLimit=${gasLimit}&redirectUrl=${redirectUrl}`;
 
   return {
     needsApproval: false,
@@ -153,12 +147,10 @@ async function prepareStorePurchaseTx(playerAddress, itemId) {
     itemName: item.name,
     priceETH: fromWei(item.price),
     priceETHWei: valueWei,
-    // expectedPrice / expectedPriceWei are the canonical fields used by Unity
-    // to verify the amount before signing (matches the full-flow spec).
     expectedPrice: fromWei(item.price),
     expectedPriceWei: valueWei,
+    encodedData, // The encoded function call data
     isAvailable: item.isAvailable,
-    deepLink,
     gasLimit,
     maxFeePerGas: feeData.maxFeePerGas?.toString(),
     explorerBase: "https://sepolia.etherscan.io",
@@ -382,6 +374,7 @@ module.exports = {
   setTreasury,
   // Player functions
   prepareStorePurchaseTx,
+  prepareStorePurchaseTxForWalletConnect,
   getPlayerInfo,
   getItem,
   getStoreItems,
