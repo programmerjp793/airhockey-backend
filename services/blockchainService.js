@@ -106,8 +106,8 @@ async function setTreasury(treasuryAddress) {
 
 // ==================== PLAYER FUNCTIONS ====================
 
-// Prepare store purchase TX data for WalletConnect (returns encoded data, not deep link)
-async function prepareStorePurchaseTxForWalletConnect(playerAddress, itemId) {
+// Prepare store purchase TX data for MetaMask Deep Link (returns deep link string)
+async function prepareStorePurchaseTx(playerAddress, itemId) {
   if (!ethers.isAddress(playerAddress)) throw new Error("Invalid player address");
 
   // Get item details
@@ -126,35 +126,52 @@ async function prepareStorePurchaseTxForWalletConnect(playerAddress, itemId) {
   }
 
   const feeData = await provider.getFeeData();
-  const gasEst = await smartStore.buyItem.estimateGas(itemId, { from: playerAddress, value: item.price }).catch(() => BigInt(120000));
-
-  // buyItem(uint256) 4-byte selector + encoded itemId
-  const selector = "0xe7fb74c7"; // buyItem(uint256) function selector
-  const encodedId = BigInt(itemId).toString(16).padStart(64, "0");
-  const encodedData = selector + encodedId;
+  const gasEst = await smartStore.buyItem
+    .estimateGas(itemId, { from: playerAddress, value: item.price })
+    .catch(() => BigInt(120000));
 
   const storeAddress = process.env.SMART_STORE_ADDRESS;
-  const valueWei = item.price.toString();
-  const gasLimit = ((gasEst * 120n) / 100n).toString();
+  const valueWei     = item.price.toString();
+  const gasLimit     = ((gasEst * 120n) / 100n).toString();   // +20% buffer
+
+  // ── CRITICAL FIX ────────────────────────────────────────────────────────────
+  // The deep link MUST include `data` so MetaMask calls buyItem(itemId) on the
+  // contract instead of sending a plain ETH transfer.
+  //
+  // Without `data`:
+  //   ✅ ETH is sent to the contract address
+  //   ❌ buyItem() is never executed
+  //   ❌ No ItemPurchased event emitted
+  //   ❌ hasPlayerBoughtItem() still returns false
+  //   ❌ Player ownership is never recorded
+  //
+  // ABI encoding of buyItem(uint256):
+  //   selector  = keccak256("buyItem(uint256)")[0..3]  = 0xe7fb74c7
+  //   argument  = itemId left-padded to 32 bytes (64 hex chars)
+  // ────────────────────────────────────────────────────────────────────────────
+  const selector   = "0xe7fb74c7";                                  // buyItem(uint256)
+  const encodedId  = BigInt(itemId).toString(16).padStart(64, "0"); // uint256 arg
+  const encodedData = selector + encodedId;                         // full calldata
+
+  // Build MetaMask mobile deep link with calldata included
+  const deepLink =
+    `https://metamask.app.link/send/${storeAddress}` +
+    `?value=${valueWei}` +
+    `&gas=${gasLimit}` +
+    `&gasPrice=${feeData.gasPrice?.toString() || "0"}` +
+    `&data=${encodedData}`;   // ← THIS was missing — now the contract function executes
+
+  console.log(`[blockchain] prepareStorePurchaseTx: itemId=${itemId} value=${valueWei} data=${encodedData}`);
 
   return {
     needsApproval: false,
-    step: "purchase",
-    storeAddress,
-    chainId: 11155111,
-    chainIdHex: "0xaa36a7",
-    itemId: Number(item.id),
-    itemName: item.name,
-    priceETH: fromWei(item.price),
-    priceETHWei: valueWei,
-    expectedPrice: fromWei(item.price),
-    expectedPriceWei: valueWei,
-    encodedData, // The encoded function call data
-    isAvailable: item.isAvailable,
+    step:          "purchase",
+    deepLink,
+    // Surface these for debugging / Unity-side logging
+    encodedData,
+    valueWei,
     gasLimit,
-    maxFeePerGas: feeData.maxFeePerGas?.toString(),
-    explorerBase: "https://sepolia.etherscan.io",
-    message: `Sign to purchase: ${item.name} (${fromWei(item.price)} ETH)`,
+    storeAddress,
   };
 }
 
@@ -374,7 +391,6 @@ module.exports = {
   setTreasury,
   // Player functions
   prepareStorePurchaseTx,
-  prepareStorePurchaseTxForWalletConnect,
   getPlayerInfo,
   getItem,
   getStoreItems,
