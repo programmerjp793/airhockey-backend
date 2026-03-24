@@ -209,7 +209,7 @@ router.post(
         });
       }
 
-      const txData = await blockchainService.prepareStorePurchaseTxForWalletConnect(playerWallet, numericId);
+      const txData = await blockchainService.prepareStorePurchaseTx(playerWallet, numericId);
 
       return res.json({
         success: true,
@@ -569,6 +569,285 @@ router.post(
 
     } catch (err) {
       console.error("[Purchase] check-ownership error:", err.message);
+      return res.status(500).json({ success: false, message: err.message });
+    }
+  }
+);
+
+// ==================== WEB APP PURCHASE FLOW ====================
+// These endpoints power the React Native wallet web app.
+// Unity opens the webAppUrl → user connects MetaMask → signs tx → web app calls confirm-web-tx.
+
+// POST /api/purchase/prepare-web-tx
+// Called by Unity WalletManager.PurchaseViaWebApp()
+// Returns a URL the web app can open with all tx params encoded in query string
+router.post(
+  "/prepare-web-tx",
+  [
+    body("itemId").notEmpty(),
+    body("walletAddress").optional().isEthereumAddress(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const { itemId, walletAddress } = req.body;
+
+      let numericId;
+      if (typeof itemId === "number" || /^\d+$/.test(String(itemId))) {
+        numericId = parseInt(itemId, 10);
+      } else {
+        numericId = ITEM_STORE_IDS[itemId];
+        if (!numericId) {
+          return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
+        }
+      }
+
+      if (numericId < 1 || numericId > 4) {
+        return res.status(400).json({ success: false, message: `Invalid itemId: ${numericId}` });
+      }
+
+      let playerWallet = walletAddress;
+
+      if (!playerWallet && req.headers.authorization) {
+        try {
+          const authService = require("../services/unityAuthService");
+          const player = await authService.verifyToken(
+            req.headers.authorization.replace("Bearer ", "")
+          );
+          if (player) playerWallet = player.walletAddress;
+        } catch (e) {
+          // Auth failed, continue without wallet
+        }
+      }
+
+      if (!playerWallet) {
+        return res.status(400).json({ success: false, message: "Wallet address is required" });
+      }
+
+      playerWallet = playerWallet.toLowerCase();
+      console.log(`[Purchase] prepare-web-tx: wallet=${playerWallet} numericId=${numericId}`);
+
+      // Check ownership
+      const hasItem = await blockchainService.hasPlayerBoughtItem(playerWallet, numericId);
+      if (hasItem) {
+        const item = await blockchainService.getItem(numericId);
+        return res.status(400).json({
+          success: false,
+          message: "Item already owned",
+          itemId: numericId,
+          itemName: item.name,
+        });
+      }
+
+      // Get full tx data from blockchain service (reuses existing logic)
+      const txData = await blockchainService.prepareStorePurchaseTx(playerWallet, numericId);
+
+      // Generate a session ID for tracking
+      const sessionId = crypto.randomUUID();
+
+      // Build the web app URL with encoded transaction params
+      const webAppBaseUrl = process.env.WEB_APP_URL || "http://localhost:8081";
+      const queryParams = new URLSearchParams({
+        to: txData.storeAddress,
+        data: txData.calldataHex,
+        value: txData.valueWei,
+        itemId: String(numericId),
+        itemName: txData.itemName,
+        priceETH: String(txData.priceETH),
+        walletAddress: playerWallet,
+        sessionId,
+      });
+
+      const webAppUrl = `${webAppBaseUrl}/pay?${queryParams.toString()}`;
+
+      console.log(`[Purchase] Web app URL: ${webAppUrl}`);
+
+      return res.json({
+        success: true,
+        webAppUrl,
+        sessionId,
+        storeAddress: txData.storeAddress,
+        calldataHex: txData.calldataHex,
+        valueWei: txData.valueWei,
+        gasLimit: txData.gasLimit,
+        chainId: txData.chainId,
+        itemId: numericId,
+        stringItemId: NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`,
+        itemName: txData.itemName,
+        priceETH: txData.priceETH,
+      });
+    } catch (err) {
+      console.error("[Purchase] prepare-web-tx error:", err.message);
+      return res.status(400).json({ success: false, message: err.message });
+    }
+  }
+);
+
+// POST /api/purchase/confirm-web-tx
+// Called by the React Native wallet web app after transaction is confirmed on-chain.
+// Validates the tx receipt and updates the player's inventory in MongoDB.
+router.post(
+  "/confirm-web-tx",
+  [
+    body("txHash").notEmpty(),
+    body("itemId").notEmpty(),
+    body("walletAddress").isEthereumAddress(),
+  ],
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    try {
+      const { txHash, itemId, walletAddress, sessionId } = req.body;
+      const playerAddress = walletAddress.toLowerCase();
+
+      let numericId;
+      if (typeof itemId === "number" || /^\d+$/.test(String(itemId))) {
+        numericId = parseInt(itemId, 10);
+      } else {
+        numericId = ITEM_STORE_IDS[itemId];
+        if (!numericId) {
+          return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
+        }
+      }
+
+      console.log(`[Purchase] confirm-web-tx: txHash=${txHash} itemId=${numericId} wallet=${playerAddress} session=${sessionId}`);
+
+      // Wait for the transaction receipt
+      let receipt;
+      try {
+        receipt = await blockchainService.provider.waitForTransaction(txHash, 1, 60000);
+      } catch (waitErr) {
+        console.error(`[Purchase] waitForTransaction error:`, waitErr.message);
+        return res.status(202).json({
+          success: false,
+          message: "Transaction not yet confirmed. Please wait.",
+          status: "pending",
+          txHash,
+        });
+      }
+
+      if (!receipt || receipt.status !== 1) {
+        // Record failed transaction
+        try {
+          const player = await Player.findOne({ walletAddress: playerAddress });
+          if (player) {
+            const item = await blockchainService.getItem(numericId);
+            await transactionService.recordTransaction({
+              transactionHash: txHash,
+              playerId: player._id,
+              playerAddress,
+              itemId: numericId,
+              itemName: item?.name || "Unknown Item",
+              priceETH: item ? blockchainService.fromWei(item.price) : "0",
+              priceWei: item ? item.price.toString() : "0",
+              status: "failed",
+              chainId: 11155111,
+              contractAddress: process.env.SMART_STORE_ADDRESS,
+              methodName: "buyItem",
+              type: "purchase",
+              metadata: { blockNumber: receipt?.blockNumber, source: "web-app", sessionId },
+            });
+            await transactionService.failTransaction(txHash, "Transaction failed on blockchain");
+          }
+        } catch (txErr) {
+          console.error(`[Purchase] Failed to record failed tx:`, txErr.message);
+        }
+
+        return res.status(400).json({
+          success: false,
+          message: "Transaction failed on blockchain",
+          status: "failed",
+          txHash,
+        });
+      }
+
+      console.log(`[Purchase] Web tx confirmed: ${txHash}, block: ${receipt.blockNumber}`);
+
+      // Verify on-chain ownership
+      const hasItem = await blockchainService.hasPlayerBoughtItem(playerAddress, numericId);
+      if (!hasItem) {
+        return res.status(400).json({
+          success: false,
+          message: "Item purchase not found on blockchain after confirmation",
+          status: "failed",
+          txHash,
+        });
+      }
+
+      const item = await blockchainService.getItem(numericId);
+      const stringItemId = NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`;
+
+      // Update MongoDB player inventory
+      let playerUpdated = false;
+      let playerId = null;
+      try {
+        const player = await Player.findOne({ walletAddress: playerAddress });
+        if (player) {
+          playerId = player._id;
+          if (!player.ownedItems.includes(stringItemId)) {
+            player.ownedItems.push(stringItemId);
+            await player.save();
+            playerUpdated = true;
+            console.log(`[Purchase] Updated inventory: ${playerAddress} → ${stringItemId}`);
+          }
+        }
+      } catch (dbErr) {
+        console.error(`[Purchase] Database update error:`, dbErr.message);
+      }
+
+      // Record transaction in MongoDB
+      if (playerId) {
+        try {
+          await transactionService.recordTransaction({
+            transactionHash: txHash,
+            playerId,
+            playerAddress,
+            itemId: numericId,
+            itemName: item.name,
+            priceETH: blockchainService.fromWei(item.price),
+            priceWei: item.price.toString(),
+            status: "pending",
+            chainId: 11155111,
+            contractAddress: process.env.SMART_STORE_ADDRESS,
+            methodName: "buyItem",
+            type: "purchase",
+            metadata: { stringItemId, source: "web-app", sessionId },
+          });
+
+          await transactionService.confirmTransaction(txHash, {
+            blockNumber: receipt.blockNumber,
+            gasUsed: receipt.gasUsed?.toString(),
+            gasPrice: receipt.gasPrice?.toString(),
+          });
+
+          console.log(`[Purchase] Web tx recorded: ${txHash}`);
+        } catch (txErr) {
+          console.error(`[Purchase] Failed to record transaction:`, txErr.message);
+        }
+      }
+
+      return res.json({
+        success: true,
+        message: "Transaction confirmed and item purchased via web app",
+        status: "confirmed",
+        txHash,
+        blockNumber: receipt.blockNumber,
+        itemId: numericId,
+        stringItemId,
+        itemName: item.name,
+        playerAddress,
+        playerInventoryUpdated: playerUpdated,
+        explorerUrl: `https://sepolia.etherscan.io/tx/${txHash}`,
+      });
+    } catch (err) {
+      console.error("[Purchase] confirm-web-tx error:", err.message);
       return res.status(500).json({ success: false, message: err.message });
     }
   }

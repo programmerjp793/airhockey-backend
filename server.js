@@ -59,6 +59,8 @@ app.get("/", (req, res) => {
       "/api/purchase/status/:intentId",
       "/api/purchase/confirm",
       "/api/purchase/check-ownership",
+      "/api/purchase/prepare-web-tx",
+      "/api/purchase/confirm-web-tx",
       "/api/wallet/balance",
       "/api/wallet/info",
       "/api/transactions/history",
@@ -83,22 +85,6 @@ app.use(errorHandler);
 // Support explicit override to new Atlas cluster and target DB.
 const mongoUri = process.env.MONGODB_URI_NEW || process.env.MONGODB_URI;
 const mongoDbName = process.env.MONGODB_DB_NAME || "pucksense";
-
-if (!mongoUri || !mongoUri.trim()) {
-  console.error("❌ MongoDB connection string is missing. Set MONGODB_URI_NEW or MONGODB_URI.");
-  process.exit(1);
-}
-
-if (!mongoUri.startsWith("mongodb://") && !mongoUri.startsWith("mongodb+srv://")) {
-  console.error(
-    "❌ MongoDB connection string has invalid scheme. It must start with mongodb:// or mongodb+srv://",
-    mongoUri
-  );
-  process.exit(1);
-}
-
-console.log(`⚙️  Using MongoDB URI: ${mongoUri.startsWith("mongodb+srv://") ? "mongodb+srv://..." : "mongodb://..."}`);
-console.log(`⚙️  Using DB Name: ${mongoDbName}`);
 
 mongoose
   .connect(mongoUri, {
