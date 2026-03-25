@@ -34,11 +34,23 @@ router.get('/balance', authenticate, async (req, res, next) => {
         note: 'No wallet linked. Connect MetaMask to see your balance.',
       });
     }
-    const info = await blockchainService.getPlayerInfo(player.walletAddress);
+    let currentBalance = player.ethBalance || '0.0000';
+    
+    try {
+      const info = await blockchainService.getPlayerInfo(player.walletAddress);
+      currentBalance = info.ethBalance;
+      
+      // Save updated balance to MongoDB Atlas
+      player.ethBalance = currentBalance;
+      await player.save();
+    } catch (chainErr) {
+      console.warn('[Wallet] Balance fetch failed, using cached:', chainErr.message);
+    }
+
     res.json({
       success: true,
       walletAddress: player.walletAddress,
-      balance: info.ethBalance,
+      balance: currentBalance,
       note: 'Use MetaMask to manage your wallet.',
     });
   } catch (err) {
@@ -60,7 +72,7 @@ router.get('/info', authenticate, async (req, res, next) => {
 
     // FIX: was getTokenBalance() then separate doesPlayerOwnItem() loop.
     // Now getPlayerInfo() returns everything in one call.
-    let ethBalance    = '0.0000';
+    let ethBalance    = player.ethBalance || '0.0000';
     let ethBalanceWei = '0';
     let tier          = 0;
     let ownedItems    = player.ownedItems || [];
@@ -74,8 +86,9 @@ router.get('/info', authenticate, async (req, res, next) => {
         tier          = info.tier;
         ownedItems    = info.ownedItemIds || ownedItems;
 
-        // Sync owned items to MongoDB for offline reference
+        // Sync owned items and ETH balance to MongoDB for offline reference
         player.ownedItems = ownedItems;
+        player.ethBalance = ethBalance;
         await player.save();
 
       } catch (chainErr) {

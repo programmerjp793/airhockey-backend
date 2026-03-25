@@ -49,6 +49,11 @@ const PlayerSchema = new mongoose.Schema({
     default: null,
   },
 
+  ethBalance: {
+    type:    String,
+    default: '0.0000',
+  },
+
   // ─── Game Stats ────────────────────────────────────────────────────────────
   stats: {
     type:    PlayerStatsSchema,
