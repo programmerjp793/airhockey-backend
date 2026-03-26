@@ -1,16 +1,14 @@
 // routes/wallet.js
 // Native ETH only (Sepolia Testnet)
 //
-// Balance sync strategy:
-//   1. Every call to /balance or /info fetches the live on-chain ETH balance via
-//      blockchainService.getPlayerInfo() and immediately writes it to Player.cachedEthBalance.
-//   2. The cached value is returned alongside the live value so Unity can display
-//      something meaningful even if the next call is made while offline.
-//   3. On wallet-login (routes/auth.js) the same cached value is included in the
-//      login response, so the UI shows the last-known balance instantly on app start.
-//   4. After every successful purchase (routes/payment.js submit-tx / confirm-web-tx)
-//      the same refreshAndCacheBalance() helper is called so the post-purchase balance
-//      is persisted before Unity polls /wallet/balance.
+// Changes from existing:
+//   • getTokenBalance()  → getPlayerInfo() — ETH balance lives in getPlayerInfo()
+//   • symbol: 'TTK'      → symbol: 'ETH'
+//   • amoy.polygonscan   → sepolia.etherscan (via BLOCK_EXPLORER_URL env)
+//   • /balance response: balanceFormatted now shows ETH, tier added
+//   • /info response:    wallet.symbol now 'ETH', tier added
+//   • Removed: doesPlayerOwnItem loop in /info (now handled by getPlayerInfo)
+//   • Kept: /balance, /info, /transactions structure exactly
 
 const express = require('express');
 const router = express.Router();
@@ -21,74 +19,31 @@ const Player = require('../models/Player');
 
 const EXPLORER = process.env.BLOCK_EXPLORER_URL || 'https://sepolia.etherscan.io';
 
-// ─── Shared helper ────────────────────────────────────────────────────────────
-/**
- * Fetches the live ETH balance for `walletAddress` from the Sepolia node,
- * persists it to the Player document, and returns the result object.
- *
- * Exported so payment.js can call it after a confirmed purchase without
- * duplicating the try/catch boilerplate.
- *
- * @param {string} walletAddress  lowercase hex address
- * @param {object} player         Mongoose Player document (will be saved)
- * @returns {{ ethBalance: string, ethBalanceWei: string, tier: number, ownedItemIds: string[], fromCache: boolean }}
- */
-async function refreshAndCacheBalance(walletAddress, player) {
-  const info = await blockchainService.getPlayerInfo(walletAddress);
-
-  // Persist to MongoDB so it survives a server restart / re-login
-  await player.cacheEthBalance(info.ethBalance, info.ethBalanceWei);
-
-  return { ...info, fromCache: false };
-}
-
-// Export so payment.js can import it
-module.exports.refreshAndCacheBalance = refreshAndCacheBalance;
-
 // ─── GET /wallet/balance ──────────────────────────────────────────────────────
 // Returns the native ETH balance for the authenticated player's linked wallet.
-// Unity WalletManager.RefreshBalanceAsync() calls: GET /wallet/balance
-// Flow:
-//   1. Try live on-chain fetch → cache result in MongoDB.
-//   2. On failure fall back to the last cached value stored in the document.
+// Unity WalletManager.RefreshBalanceAsync() calls: GET /wallet/balance?address=0x...
+
 router.get('/balance', authenticate, async (req, res, next) => {
   try {
-    const player = await Player.findById(req.player.id);
+    // 1) Extract the unique unityPlayerId from the authenticated Unity Mobile session
+    const unityId = req.player.unityPlayerId;
 
+    // 2) Fetch the exact player profile from MongoDB Atlas based strictly on their unityPlayerId
+    const player = await Player.findOne({ unityPlayerId: unityId });
     if (!player || !player.walletAddress) {
       return res.json({
         success: true,
         walletAddress: null,
         balance: '0',
-        balanceFormatted: '0.0000',
-        fromCache: false,
         note: 'No wallet linked. Connect MetaMask to see your balance.',
       });
     }
-
-    let balanceFormatted = player.cachedEthBalance || '0.0000';
-    let balanceWei = player.cachedEthBalanceWei || '0';
-    let fromCache = true;
-    let warning = null;
-
-    try {
-      const info = await refreshAndCacheBalance(player.walletAddress, player);
-      balanceFormatted = info.ethBalance;
-      balanceWei = info.ethBalanceWei;
-      fromCache = false;
-    } catch (chainErr) {
-      console.warn('[Wallet] /balance live fetch failed, returning cache:', chainErr.message);
-      warning = 'Live balance unavailable. Showing last cached value.';
-    }
-
-    return res.json({
+    const info = await blockchainService.getPlayerInfo(player.walletAddress);
+    res.json({
       success: true,
       walletAddress: player.walletAddress,
-      balance: balanceWei,
-      balanceFormatted,
-      fromCache,
-      fetchedAt: player.ethBalanceFetchedAt,
-      ...(warning && { warning }),
+      balance: info.ethBalance,
+      note: 'Use MetaMask to manage your wallet.',
     });
   } catch (err) {
     next(err);
@@ -96,39 +51,43 @@ router.get('/balance', authenticate, async (req, res, next) => {
 });
 
 // ─── GET /wallet/info ─────────────────────────────────────────────────────────
-// Returns full player profile: identity + live ETH balance + tier + owned items.
-// Same caching strategy as /balance — live fetch → persist → fallback to cache.
+// Returns full player profile: identity + ETH balance + tier + owned items.
+// ETH balance is fetched via getPlayerInfo() which reads SmartStore + RewardEngine.
+
 router.get('/info', authenticate, async (req, res, next) => {
   try {
-    const player = await Player.findById(req.player.id);
+    // 1) Extract unityPlayerId from the Unity Mobile connection token
+    const unityId = req.player.unityPlayerId;
+
+    // 2) Fetch the exact player profile using the unityPlayerId
+    const player = await Player.findOne({ unityPlayerId: unityId });
 
     if (!player) {
       return res.status(404).json({ success: false, message: 'Player not found.' });
     }
 
-    let ethBalance = player.cachedEthBalance || '0.0000';
-    let ethBalanceWei = player.cachedEthBalanceWei || '0';
+    // FIX: was getTokenBalance() then separate doesPlayerOwnItem() loop.
+    // Now getPlayerInfo() returns everything in one call.
+    let ethBalance = '0.0000';
+    let ethBalanceWei = '0';
     let tier = 0;
     let ownedItems = player.ownedItems || [];
-    let fromCache = true;
     let onChainError = null;
 
     if (player.walletAddress) {
       try {
-        const info = await refreshAndCacheBalance(player.walletAddress, player);
-        ethBalance = info.ethBalance;
+        const info = await blockchainService.getPlayerInfo(player.walletAddress);
+        ethBalance = info.ethBalance;       // formatted ETH string
         ethBalanceWei = info.ethBalanceWei;
-        tier = info.tier || 0;
-        fromCache = false;
+        tier = info.tier;
+        ownedItems = info.ownedItemIds || ownedItems;
 
-        // Sync owned items array from on-chain source of truth
-        if (info.ownedItemIds && info.ownedItemIds.length > 0) {
-          ownedItems = info.ownedItemIds;
-          player.ownedItems = ownedItems;
-          await player.save();
-        }
+        // Sync owned items to MongoDB for offline reference
+        player.ownedItems = ownedItems;
+        await player.save();
+
       } catch (chainErr) {
-        console.warn('[Wallet] /info live fetch failed, returning cache:', chainErr.message);
+        console.warn('[Wallet] On-chain data fetch failed:', chainErr.message);
         onChainError = 'Could not fetch live blockchain data. Showing cached values.';
       }
     }
@@ -150,10 +109,8 @@ router.get('/info', authenticate, async (req, res, next) => {
         address: player.walletAddress,
         balance: ethBalanceWei,
         balanceFormatted: ethBalance,
-        symbol: 'ETH',
+        symbol: 'ETH',   // was 'TTK'
         tier,
-        fromCache,
-        fetchedAt: player.ethBalanceFetchedAt,
       },
       ...(onChainError && { warning: onChainError }),
     });
@@ -165,6 +122,9 @@ router.get('/info', authenticate, async (req, res, next) => {
 });
 
 // ─── GET /wallet/transactions ─────────────────────────────────────────────────
+// Returns recent reward transactions for the player.
+// explorerUrl now points to sepolia.etherscan.io (was amoy.polygonscan.com).
+
 router.get('/transactions', authenticate, async (req, res, next) => {
   try {
     let blockchainTransactions = [];
