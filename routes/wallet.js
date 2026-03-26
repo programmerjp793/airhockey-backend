@@ -10,12 +10,12 @@
 //   • Removed: doesPlayerOwnItem loop in /info (now handled by getPlayerInfo)
 //   • Kept: /balance, /info, /transactions structure exactly
 
-const express           = require('express');
-const router            = express.Router();
-const authenticate      = require('../middleware/authenticate');
+const express = require('express');
+const router = express.Router();
+const authenticate = require('../middleware/authenticate');
 const blockchainService = require('../services/blockchainService');
 const transactionService = require('../services/transactionService');
-const Player            = require('../models/Player');
+const Player = require('../models/Player');
 
 const EXPLORER = process.env.BLOCK_EXPLORER_URL || 'https://sepolia.etherscan.io';
 
@@ -25,7 +25,11 @@ const EXPLORER = process.env.BLOCK_EXPLORER_URL || 'https://sepolia.etherscan.io
 
 router.get('/balance', authenticate, async (req, res, next) => {
   try {
-    const player = await Player.findById(req.player.id);
+    // 1) Extract the unique unityPlayerId from the authenticated Unity Mobile session
+    const unityId = req.player.unityPlayerId;
+
+    // 2) Fetch the exact player profile from MongoDB Atlas based strictly on their unityPlayerId
+    const player = await Player.findOne({ unityPlayerId: unityId });
     if (!player || !player.walletAddress) {
       return res.json({
         success: true,
@@ -34,23 +38,11 @@ router.get('/balance', authenticate, async (req, res, next) => {
         note: 'No wallet linked. Connect MetaMask to see your balance.',
       });
     }
-    let currentBalance = player.ethBalance || '0.0000';
-    
-    try {
-      const info = await blockchainService.getPlayerInfo(player.walletAddress);
-      currentBalance = info.ethBalance;
-      
-      // Save updated balance to MongoDB Atlas
-      player.ethBalance = currentBalance;
-      await player.save();
-    } catch (chainErr) {
-      console.warn('[Wallet] Balance fetch failed, using cached:', chainErr.message);
-    }
-
+    const info = await blockchainService.getPlayerInfo(player.walletAddress);
     res.json({
       success: true,
       walletAddress: player.walletAddress,
-      balance: currentBalance,
+      balance: info.ethBalance,
       note: 'Use MetaMask to manage your wallet.',
     });
   } catch (err) {
@@ -64,7 +56,11 @@ router.get('/balance', authenticate, async (req, res, next) => {
 
 router.get('/info', authenticate, async (req, res, next) => {
   try {
-    const player = await Player.findById(req.player.id);
+    // 1) Extract unityPlayerId from the Unity Mobile connection token
+    const unityId = req.player.unityPlayerId;
+
+    // 2) Fetch the exact player profile using the unityPlayerId
+    const player = await Player.findOne({ unityPlayerId: unityId });
 
     if (!player) {
       return res.status(404).json({ success: false, message: 'Player not found.' });
@@ -72,23 +68,22 @@ router.get('/info', authenticate, async (req, res, next) => {
 
     // FIX: was getTokenBalance() then separate doesPlayerOwnItem() loop.
     // Now getPlayerInfo() returns everything in one call.
-    let ethBalance    = player.ethBalance || '0.0000';
+    let ethBalance = '0.0000';
     let ethBalanceWei = '0';
-    let tier          = 0;
-    let ownedItems    = player.ownedItems || [];
-    let onChainError  = null;
+    let tier = 0;
+    let ownedItems = player.ownedItems || [];
+    let onChainError = null;
 
     if (player.walletAddress) {
       try {
         const info = await blockchainService.getPlayerInfo(player.walletAddress);
-        ethBalance    = info.ethBalance;       // formatted ETH string
+        ethBalance = info.ethBalance;       // formatted ETH string
         ethBalanceWei = info.ethBalanceWei;
-        tier          = info.tier;
-        ownedItems    = info.ownedItemIds || ownedItems;
+        tier = info.tier;
+        ownedItems = info.ownedItemIds || ownedItems;
 
-        // Sync owned items and ETH balance to MongoDB for offline reference
+        // Sync owned items to MongoDB for offline reference
         player.ownedItems = ownedItems;
-        player.ethBalance = ethBalance;
         await player.save();
 
       } catch (chainErr) {
@@ -100,21 +95,21 @@ router.get('/info', authenticate, async (req, res, next) => {
     return res.json({
       success: true,
       player: {
-        id:            player._id.toString(),
+        id: player._id.toString(),
         unityPlayerId: player.unityPlayerId,
-        username:      player.username,
-        email:         player.email,
+        username: player.username,
+        email: player.email,
         walletAddress: player.walletAddress,
-        stats:         player.stats,
+        stats: player.stats,
         ownedItems,
-        createdAt:     player.createdAt,
-        lastSeenAt:    player.lastSeenAt,
+        createdAt: player.createdAt,
+        lastSeenAt: player.lastSeenAt,
       },
       wallet: {
-        address:          player.walletAddress,
-        balance:          ethBalanceWei,
+        address: player.walletAddress,
+        balance: ethBalanceWei,
         balanceFormatted: ethBalance,
-        symbol:           'ETH',   // was 'TTK'
+        symbol: 'ETH',   // was 'TTK'
         tier,
       },
       ...(onChainError && { warning: onChainError }),
