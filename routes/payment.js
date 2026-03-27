@@ -9,6 +9,14 @@
 //   • Unity's next call to GET /wallet/balance returns the post-purchase amount.
 //   • If the player quits and re-opens the app, the login response (auth.js)
 //     includes cachedEthBalance so the UI is populated immediately.
+//
+// Cross-wallet ownership enforcement:
+//   Before allowing any purchase we check BOTH:
+//     1. player.ownedItems (MongoDB) — catches items bought by any prior wallet
+//        linked to this account, preventing a second wallet re-buying the same item.
+//     2. hasPlayerBoughtItem (on-chain) — the smart contract's own guard for the
+//        current wallet address.
+//   The MongoDB check runs first so no ETH is spent unnecessarily.
 
 const express = require("express");
 const { body, validationResult } = require("express-validator");
@@ -17,9 +25,6 @@ const crypto = require("crypto");
 const Player = require("../models/Player");
 const blockchainService = require("../services/blockchainService");
 const transactionService = require("../services/transactionService");
-
-// Import the shared balance-refresh helper from wallet.js.
-// wallet.js exports it on module.exports so we can require it here.
 const { refreshAndCacheBalance } = require("./wallet");
 
 const router = express.Router();
@@ -49,8 +54,6 @@ function resolveNumericId(itemId) {
 }
 
 // ─── Internal helper: refresh + cache balance, swallow errors ─────────────────
-// Called fire-and-forget after a confirmed purchase so the player document
-// always holds the latest post-purchase ETH balance.
 async function safeRefreshBalance(playerAddress) {
   try {
     const player = await Player.findOne({ walletAddress: playerAddress });
@@ -59,9 +62,24 @@ async function safeRefreshBalance(playerAddress) {
       console.log(`[Purchase] Balance refreshed and cached for ${playerAddress}`);
     }
   } catch (err) {
-    // Non-fatal — the player still owns the item; log and continue.
     console.warn(`[Purchase] Post-purchase balance refresh failed for ${playerAddress}:`, err.message);
   }
+}
+
+// ─── Cross-wallet ownership check ────────────────────────────────────────────
+// Looks up the player document by walletAddress, then checks ownedItems.
+// Returns the player document if the account already owns the item via ANY
+// previously linked wallet, or null if the item is not yet owned.
+//
+// This is the key guard: because ownedItems is written using the string item ID
+// (e.g. "wallet_upgrade_1") and is shared on the single player document, any
+// item purchased by wallet A will appear in ownedItems when wallet B (on the
+// same account) attempts to buy the same item.
+async function findPlayerWhoOwnsItem(walletAddress, stringItemId) {
+  const player = await Player.findOne({ walletAddress: walletAddress.toLowerCase() });
+  if (!player) return null;
+  if (player.ownedItems.includes(stringItemId)) return player;
+  return null;
 }
 
 // ==================== PAYMENT INTENT (Fiat / GCash) ====================
@@ -201,6 +219,23 @@ router.post(
       playerWallet = playerWallet.toLowerCase();
       console.log(`[Purchase] prepare-tx: wallet=${playerWallet} numericId=${numericId}`);
 
+      const stringItemId = NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`;
+
+      // ── Cross-wallet ownership check (MongoDB) ────────────────────────────
+      // Runs before the on-chain check so no ETH is spent if the account
+      // already owns this item via a different linked wallet.
+      const alreadyOwner = await findPlayerWhoOwnsItem(playerWallet, stringItemId);
+      if (alreadyOwner) {
+        const item = await blockchainService.getItem(numericId);
+        return res.status(400).json({
+          success: false,
+          message: "Your account already owns this item (purchased with a linked wallet)",
+          itemId: numericId,
+          itemName: item.name,
+        });
+      }
+
+      // ── On-chain ownership check (current wallet) ─────────────────────────
       const item = await blockchainService.getItem(numericId);
       const hasItem = await blockchainService.hasPlayerBoughtItem(playerWallet, numericId);
 
@@ -218,7 +253,7 @@ router.post(
       return res.json({
         success: true,
         ...txData,
-        stringItemId: NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`,
+        stringItemId,
         itemId: numericId,
       });
 
@@ -247,12 +282,23 @@ router.post("/prepare-store-tx", async (req, res) => {
     }
 
     const playerWallet = walletAddress.toLowerCase();
+    const stringItemId = NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`;
+
+    // ── Cross-wallet ownership check (MongoDB) ────────────────────────────
+    const alreadyOwner = await findPlayerWhoOwnsItem(playerWallet, stringItemId);
+    if (alreadyOwner) {
+      return res.status(400).json({
+        success: false,
+        message: "Your account already owns this item (purchased with a linked wallet)",
+      });
+    }
+
     const txData = await blockchainService.prepareStorePurchaseTx(playerWallet, numericId);
 
     return res.json({
       success: true,
       ...txData,
-      stringItemId: NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`,
+      stringItemId,
     });
   } catch (err) {
     return res.status(400).json({ success: false, message: err.message });
@@ -376,6 +422,11 @@ router.post(
             await playerDoc.save();
             playerUpdated = true;
             console.log(`[Purchase] Updated player inventory: ${playerAddress} now owns ${stringItemId}`);
+          } else {
+            // Item already in ownedItems — another wallet on this account
+            // already bought it. The on-chain tx still went through (ETH was
+            // spent) so we confirm it but skip the duplicate ownedItems push.
+            console.log(`[Purchase] ${stringItemId} already in ownedItems (cross-wallet purchase), skipping duplicate add`);
           }
         }
       } catch (dbErr) {
@@ -412,9 +463,6 @@ router.post(
       }
 
       // ── Refresh + cache the post-purchase ETH balance ─────────────────────
-      // This is fire-and-forget — we don't want to delay the purchase response
-      // if the RPC call is slow, but we want the balance written to MongoDB
-      // before Unity polls /wallet/balance or the user re-logs-in.
       safeRefreshBalance(playerAddress);
 
       return res.json({
@@ -505,7 +553,22 @@ router.post(
       const { walletAddress, itemId } = req.body;
       const playerAddress = walletAddress.toLowerCase();
       const numericItemId = parseInt(itemId, 10);
+      const stringItemId = NUMERIC_TO_ITEM_ID[numericItemId] || `item_${numericItemId}`;
 
+      // ── Cross-wallet check: MongoDB ownedItems ────────────────────────────
+      const dbOwner = await findPlayerWhoOwnsItem(playerAddress, stringItemId);
+      if (dbOwner) {
+        const item = await blockchainService.getItem(numericItemId);
+        return res.json({
+          success: true,
+          message: "Item purchase confirmed",
+          itemId: numericItemId,
+          itemName: item.name,
+          playerAddress,
+        });
+      }
+
+      // ── On-chain check ────────────────────────────────────────────────────
       const hasItem = await blockchainService.hasPlayerBoughtItem(playerAddress, numericItemId);
       if (!hasItem) {
         return res.status(400).json({
@@ -547,13 +610,17 @@ router.post(
       const { walletAddress, itemId } = req.body;
       const playerAddress = walletAddress.toLowerCase();
       const numericItemId = parseInt(itemId, 10);
+      const stringItemId = NUMERIC_TO_ITEM_ID[numericItemId] || `item_${numericItemId}`;
 
-      const hasItem = await blockchainService.hasPlayerBoughtItem(playerAddress, numericItemId);
+      // Check MongoDB (cross-wallet) first, then fall back to on-chain
+      const dbOwner = await findPlayerWhoOwnsItem(playerAddress, stringItemId);
+      const hasOnChain = await blockchainService.hasPlayerBoughtItem(playerAddress, numericItemId);
+      const ownsItem = !!dbOwner || hasOnChain;
+
       const item = await blockchainService.getItem(numericItemId);
-
       return res.json({
         success: true,
-        ownsItem: hasItem,
+        ownsItem,
         itemId: numericItemId,
         itemName: item.name,
         playerAddress,
@@ -611,6 +678,21 @@ router.post(
       playerWallet = playerWallet.toLowerCase();
       console.log(`[Purchase] prepare-web-tx: wallet=${playerWallet} numericId=${numericId}`);
 
+      const stringItemId = NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`;
+
+      // ── Cross-wallet ownership check (MongoDB) ────────────────────────────
+      const alreadyOwner = await findPlayerWhoOwnsItem(playerWallet, stringItemId);
+      if (alreadyOwner) {
+        const item = await blockchainService.getItem(numericId);
+        return res.status(400).json({
+          success: false,
+          message: "Your account already owns this item (purchased with a linked wallet)",
+          itemId: numericId,
+          itemName: item.name,
+        });
+      }
+
+      // ── On-chain ownership check ──────────────────────────────────────────
       const hasItem = await blockchainService.hasPlayerBoughtItem(playerWallet, numericId);
       if (hasItem) {
         const item = await blockchainService.getItem(numericId);
@@ -650,7 +732,7 @@ router.post(
         gasLimit: txData.gasLimit,
         chainId: txData.chainId,
         itemId: numericId,
-        stringItemId: NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`,
+        stringItemId,
         itemName: txData.itemName,
         priceETH: txData.priceETH,
       });
@@ -767,6 +849,9 @@ router.post(
             await playerDoc.save();
             playerUpdated = true;
             console.log(`[Purchase] Updated inventory: ${playerAddress} → ${stringItemId}`);
+          } else {
+            // Already owned via another wallet on the same account — skip duplicate push.
+            console.log(`[Purchase] ${stringItemId} already in ownedItems (cross-wallet purchase), skipping duplicate add`);
           }
         }
       } catch (dbErr) {
@@ -803,8 +888,6 @@ router.post(
       }
 
       // ── Refresh + cache the post-purchase ETH balance ─────────────────────
-      // Fire-and-forget: we respond to the web app immediately but ensure
-      // the balance is written to MongoDB before Unity resumes in the foreground.
       safeRefreshBalance(playerAddress);
 
       return res.json({
