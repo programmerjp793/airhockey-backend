@@ -3,10 +3,12 @@
 //
 // MOUNT POINT: This router is mounted at /api/purchase in server.js.
 //
-// FIX: Added /create-intent and /status/:intentId routes here so Unity can
-// reach them at /api/purchase/create-intent and /api/purchase/status/:intentId.
-// Previously they were only reachable at /api/payment/... which returned 404
-// because the router is mounted at /api/purchase, not /api/payment.
+// Balance sync: After every confirmed purchase (submit-tx and confirm-web-tx)
+// the player's live ETH balance is fetched from the Sepolia node and cached in
+// MongoDB via wallet.refreshAndCacheBalance(). This means:
+//   • Unity's next call to GET /wallet/balance returns the post-purchase amount.
+//   • If the player quits and re-opens the app, the login response (auth.js)
+//     includes cachedEthBalance so the UI is populated immediately.
 
 const express = require("express");
 const { body, validationResult } = require("express-validator");
@@ -15,6 +17,10 @@ const crypto = require("crypto");
 const Player = require("../models/Player");
 const blockchainService = require("../services/blockchainService");
 const transactionService = require("../services/transactionService");
+
+// Import the shared balance-refresh helper from wallet.js.
+// wallet.js exports it on module.exports so we can require it here.
+const { refreshAndCacheBalance } = require("./wallet");
 
 const router = express.Router();
 
@@ -34,16 +40,36 @@ const NUMERIC_TO_ITEM_ID = {
   4: "custom_skin",
 };
 
+// ─── Internal helper: resolve itemId to its numeric form ─────────────────────
+function resolveNumericId(itemId) {
+  if (typeof itemId === "number" || /^\d+$/.test(String(itemId))) {
+    return parseInt(itemId, 10);
+  }
+  return ITEM_STORE_IDS[itemId] || null;
+}
+
+// ─── Internal helper: refresh + cache balance, swallow errors ─────────────────
+// Called fire-and-forget after a confirmed purchase so the player document
+// always holds the latest post-purchase ETH balance.
+async function safeRefreshBalance(playerAddress) {
+  try {
+    const player = await Player.findOne({ walletAddress: playerAddress });
+    if (player) {
+      await refreshAndCacheBalance(playerAddress, player);
+      console.log(`[Purchase] Balance refreshed and cached for ${playerAddress}`);
+    }
+  } catch (err) {
+    // Non-fatal — the player still owns the item; log and continue.
+    console.warn(`[Purchase] Post-purchase balance refresh failed for ${playerAddress}:`, err.message);
+  }
+}
+
 // ==================== PAYMENT INTENT (Fiat / GCash) ====================
-// These are called by StoreManager.PurchaseBlockchainItemWithFiat()
-// Unity calls: POST /api/purchase/create-intent
-//              GET  /api/purchase/status/:intentId
 
 // In-memory intent store (replace with Redis or DB for production)
 const paymentIntents = new Map();
 
 // POST /api/purchase/create-intent
-// Called by Unity StoreManager.PurchaseBlockchainItemWithFiat()
 router.post(
   "/create-intent",
   [body("itemId").notEmpty()],
@@ -55,15 +81,8 @@ router.post(
 
     try {
       const { itemId } = req.body;
-
       const intentId = crypto.randomUUID();
-
-      let numericId;
-      if (typeof itemId === "number" || /^\d+$/.test(String(itemId))) {
-        numericId = parseInt(itemId, 10);
-      } else {
-        numericId = ITEM_STORE_IDS[itemId] || itemId;
-      }
+      const numericId = resolveNumericId(itemId) || itemId;
 
       paymentIntents.set(intentId, {
         itemId: numericId,
@@ -76,12 +95,9 @@ router.post(
 
       return res.json({
         success: true,
-        // FIX: field name must be paymentIntentId (matches CreateIntentResponse.cs)
         paymentIntentId: intentId,
         status: "pending",
         itemId: numericId,
-        // checkoutUrl is empty here — a real PayMongo integration would
-        // call the PayMongo API and return the actual checkout URL.
         checkoutUrl: "",
       });
 
@@ -93,7 +109,6 @@ router.post(
 );
 
 // GET /api/purchase/status/:intentId
-// Called by Unity StoreManager.PollPaymentStatusAsync()
 router.get("/status/:intentId", async (req, res) => {
   const { intentId } = req.params;
 
@@ -103,7 +118,6 @@ router.get("/status/:intentId", async (req, res) => {
 
   try {
     console.log(`[Payment] status check: intentId=${intentId}`);
-
     const intent = paymentIntents.get(intentId);
 
     if (!intent) {
@@ -131,13 +145,12 @@ router.get("/status/:intentId", async (req, res) => {
   }
 });
 
-// Helper to update intent status — used internally when payment is confirmed
 function updatePaymentIntent(intentId, newStatus, txHash, explorerUrl) {
   const intent = paymentIntents.get(intentId);
   if (intent) {
     intent.status = newStatus;
     intent.updatedAt = new Date().toISOString();
-    if (txHash)      intent.txHash      = txHash;
+    if (txHash) intent.txHash = txHash;
     if (explorerUrl) intent.explorerUrl = explorerUrl;
     paymentIntents.set(intentId, intent);
     return true;
@@ -148,7 +161,6 @@ function updatePaymentIntent(intentId, newStatus, txHash, explorerUrl) {
 // ==================== ETH PURCHASE FLOW ====================
 
 // POST /api/purchase/prepare-tx
-// Called by WalletManager.PurchaseStoreItem() — returns transaction data for WalletConnect
 router.post(
   "/prepare-tx",
   [
@@ -163,17 +175,11 @@ router.post(
 
     try {
       const { itemId, walletAddress } = req.body;
+      const numericId = resolveNumericId(itemId);
 
-      let numericId;
-      if (typeof itemId === "number" || /^\d+$/.test(String(itemId))) {
-        numericId = parseInt(itemId, 10);
-      } else {
-        numericId = ITEM_STORE_IDS[itemId];
-        if (!numericId) {
-          return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
-        }
+      if (!numericId) {
+        return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
       }
-
       if (numericId < 1 || numericId > 4) {
         return res.status(400).json({ success: false, message: `Invalid itemId: ${numericId}` });
       }
@@ -185,9 +191,7 @@ router.post(
           const authService = require("../services/unityAuthService");
           const player = await authService.verifyToken(req.headers.authorization.replace("Bearer ", ""));
           if (player) playerWallet = player.walletAddress;
-        } catch (e) {
-          // Auth failed, continue without wallet
-        }
+        } catch (e) { /* continue */ }
       }
 
       if (!playerWallet) {
@@ -198,8 +202,8 @@ router.post(
       console.log(`[Purchase] prepare-tx: wallet=${playerWallet} numericId=${numericId}`);
 
       const item = await blockchainService.getItem(numericId);
-
       const hasItem = await blockchainService.hasPlayerBoughtItem(playerWallet, numericId);
+
       if (hasItem) {
         return res.status(400).json({
           success: false,
@@ -225,7 +229,7 @@ router.post(
   }
 );
 
-// Legacy alias: POST /api/purchase/prepare-store-tx → same as /prepare
+// Legacy alias
 router.post("/prepare-store-tx", async (req, res) => {
   const { itemId, walletAddress } = req.body;
 
@@ -234,16 +238,10 @@ router.post("/prepare-store-tx", async (req, res) => {
   }
 
   try {
-    let numericId;
-    if (typeof itemId === "number" || /^\d+$/.test(String(itemId))) {
-      numericId = parseInt(itemId, 10);
-    } else {
-      numericId = ITEM_STORE_IDS[itemId];
-      if (!numericId) {
-        return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
-      }
+    const numericId = resolveNumericId(itemId);
+    if (!numericId) {
+      return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
     }
-
     if (numericId < 1 || numericId > 4) {
       return res.status(400).json({ success: false, message: `Invalid itemId: ${numericId}` });
     }
@@ -262,7 +260,9 @@ router.post("/prepare-store-tx", async (req, res) => {
 });
 
 // POST /api/purchase/submit-tx
-// Called by WalletManager after MetaMask returns txHash
+// Called by WalletManager after MetaMask returns txHash.
+// After confirming the tx on-chain, immediately refreshes and caches the
+// player's new ETH balance in MongoDB.
 router.post(
   "/submit-tx",
   [
@@ -279,19 +279,15 @@ router.post(
     try {
       const { txHash, itemId, walletAddress } = req.body;
       const playerAddress = walletAddress.toLowerCase();
+      const numericId = resolveNumericId(itemId);
 
-      let numericId;
-      if (typeof itemId === "number" || /^\d+$/.test(String(itemId))) {
-        numericId = parseInt(itemId, 10);
-      } else {
-        numericId = ITEM_STORE_IDS[itemId];
-        if (!numericId) {
-          return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
-        }
+      if (!numericId) {
+        return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
       }
 
       console.log(`[Purchase] submit-tx: txHash=${txHash} itemId=${numericId} wallet=${playerAddress}`);
 
+      // ── Wait for on-chain confirmation ────────────────────────────────────
       let receipt;
       try {
         receipt = await blockchainService.provider.waitForTransaction(txHash, 1, 60000);
@@ -329,7 +325,6 @@ router.post(
                 reason: 'Transaction failed on blockchain',
               },
             });
-
             if (receipt?.blockNumber) {
               await transactionService.confirmTransaction(txHash, {
                 blockNumber: receipt.blockNumber,
@@ -337,7 +332,6 @@ router.post(
                 gasPrice: receipt.gasPrice?.toString(),
               });
             }
-
             await transactionService.failTransaction(txHash, 'Transaction failed on blockchain');
           }
         } catch (txErr) {
@@ -368,15 +362,18 @@ router.post(
       const item = await blockchainService.getItem(numericId);
       const stringItemId = NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`;
 
+      // ── Update MongoDB inventory ──────────────────────────────────────────
       let playerUpdated = false;
       let playerId = null;
+      let playerDoc = null;
+
       try {
-        const player = await Player.findOne({ walletAddress: playerAddress });
-        if (player) {
-          playerId = player._id;
-          if (!player.ownedItems.includes(stringItemId)) {
-            player.ownedItems.push(stringItemId);
-            await player.save();
+        playerDoc = await Player.findOne({ walletAddress: playerAddress });
+        if (playerDoc) {
+          playerId = playerDoc._id;
+          if (!playerDoc.ownedItems.includes(stringItemId)) {
+            playerDoc.ownedItems.push(stringItemId);
+            await playerDoc.save();
             playerUpdated = true;
             console.log(`[Purchase] Updated player inventory: ${playerAddress} now owns ${stringItemId}`);
           }
@@ -385,7 +382,7 @@ router.post(
         console.error(`[Purchase] Database update error:`, dbErr.message);
       }
 
-      // Record transaction in MongoDB
+      // ── Record transaction ────────────────────────────────────────────────
       if (playerId) {
         try {
           await transactionService.recordTransaction({
@@ -401,25 +398,24 @@ router.post(
             contractAddress: process.env.SMART_STORE_ADDRESS,
             methodName: 'buyItem',
             type: 'purchase',
-            metadata: {
-              stringItemId,
-              receiptBlockNumber: receipt.blockNumber,
-            },
+            metadata: { stringItemId, receiptBlockNumber: receipt.blockNumber },
           });
-
-          // Confirm the transaction with block details
           await transactionService.confirmTransaction(txHash, {
             blockNumber: receipt.blockNumber,
             gasUsed: receipt.gasUsed.toString(),
             gasPrice: receipt.gasPrice.toString(),
           });
-
           console.log(`[Purchase] Transaction recorded: ${txHash}`);
         } catch (txErr) {
           console.error(`[Purchase] Failed to record transaction:`, txErr.message);
-          // Don't fail the purchase if transaction recording fails
         }
       }
+
+      // ── Refresh + cache the post-purchase ETH balance ─────────────────────
+      // This is fire-and-forget — we don't want to delay the purchase response
+      // if the RPC call is slow, but we want the balance written to MongoDB
+      // before Unity polls /wallet/balance or the user re-logs-in.
+      safeRefreshBalance(playerAddress);
 
       return res.json({
         success: true,
@@ -432,6 +428,7 @@ router.post(
         itemName: item.name,
         playerAddress,
         playerInventoryUpdated: playerUpdated,
+        explorerUrl: `https://sepolia.etherscan.io/tx/${txHash}`,
       });
 
     } catch (err) {
@@ -442,18 +439,15 @@ router.post(
 );
 
 // GET /api/purchase/status?txHash=...
-// Called by WalletManager.PollTransactionStatus() for ETH tx polling
 router.get("/status", async (req, res) => {
   const { txHash } = req.query;
 
-  // If no txHash query param, this might be the intentId path — return 400
   if (!txHash) {
     return res.status(400).json({ success: false, message: "txHash query param is required" });
   }
 
   try {
     console.log(`[Purchase] status check: txHash=${txHash}`);
-
     const currentBlock = await blockchainService.provider.getBlockNumber();
 
     let receipt;
@@ -513,7 +507,6 @@ router.post(
       const numericItemId = parseInt(itemId, 10);
 
       const hasItem = await blockchainService.hasPlayerBoughtItem(playerAddress, numericItemId);
-
       if (!hasItem) {
         return res.status(400).json({
           success: false,
@@ -522,7 +515,6 @@ router.post(
       }
 
       const item = await blockchainService.getItem(numericItemId);
-
       return res.json({
         success: true,
         message: "Item purchase confirmed",
@@ -575,12 +567,8 @@ router.post(
 );
 
 // ==================== WEB APP PURCHASE FLOW ====================
-// These endpoints power the React Native wallet web app.
-// Unity opens the webAppUrl → user connects MetaMask → signs tx → web app calls confirm-web-tx.
 
 // POST /api/purchase/prepare-web-tx
-// Called by Unity WalletManager.PurchaseViaWebApp()
-// Returns a URL the web app can open with all tx params encoded in query string
 router.post(
   "/prepare-web-tx",
   [
@@ -595,17 +583,11 @@ router.post(
 
     try {
       const { itemId, walletAddress } = req.body;
+      const numericId = resolveNumericId(itemId);
 
-      let numericId;
-      if (typeof itemId === "number" || /^\d+$/.test(String(itemId))) {
-        numericId = parseInt(itemId, 10);
-      } else {
-        numericId = ITEM_STORE_IDS[itemId];
-        if (!numericId) {
-          return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
-        }
+      if (!numericId) {
+        return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
       }
-
       if (numericId < 1 || numericId > 4) {
         return res.status(400).json({ success: false, message: `Invalid itemId: ${numericId}` });
       }
@@ -619,9 +601,7 @@ router.post(
             req.headers.authorization.replace("Bearer ", "")
           );
           if (player) playerWallet = player.walletAddress;
-        } catch (e) {
-          // Auth failed, continue without wallet
-        }
+        } catch (e) { /* continue */ }
       }
 
       if (!playerWallet) {
@@ -631,7 +611,6 @@ router.post(
       playerWallet = playerWallet.toLowerCase();
       console.log(`[Purchase] prepare-web-tx: wallet=${playerWallet} numericId=${numericId}`);
 
-      // Check ownership
       const hasItem = await blockchainService.hasPlayerBoughtItem(playerWallet, numericId);
       if (hasItem) {
         const item = await blockchainService.getItem(numericId);
@@ -643,13 +622,9 @@ router.post(
         });
       }
 
-      // Get full tx data from blockchain service (reuses existing logic)
       const txData = await blockchainService.prepareStorePurchaseTx(playerWallet, numericId);
-
-      // Generate a session ID for tracking
       const sessionId = crypto.randomUUID();
 
-      // Build the web app URL with encoded transaction params
       const webAppBaseUrl = process.env.WEB_APP_URL || "http://localhost:8081";
       const queryParams = new URLSearchParams({
         to: txData.storeAddress,
@@ -663,7 +638,6 @@ router.post(
       });
 
       const webAppUrl = `${webAppBaseUrl}/pay?${queryParams.toString()}`;
-
       console.log(`[Purchase] Web app URL: ${webAppUrl}`);
 
       return res.json({
@@ -680,6 +654,7 @@ router.post(
         itemName: txData.itemName,
         priceETH: txData.priceETH,
       });
+
     } catch (err) {
       console.error("[Purchase] prepare-web-tx error:", err.message);
       return res.status(400).json({ success: false, message: err.message });
@@ -688,8 +663,9 @@ router.post(
 );
 
 // POST /api/purchase/confirm-web-tx
-// Called by the React Native wallet web app after transaction is confirmed on-chain.
-// Validates the tx receipt and updates the player's inventory in MongoDB.
+// Called by the React Native wallet web app after the transaction is confirmed.
+// Validates the receipt, updates inventory in MongoDB, then refreshes and caches
+// the player's new ETH balance so it is ready when Unity polls /wallet/balance.
 router.post(
   "/confirm-web-tx",
   [
@@ -706,20 +682,15 @@ router.post(
     try {
       const { txHash, itemId, walletAddress, sessionId } = req.body;
       const playerAddress = walletAddress.toLowerCase();
+      const numericId = resolveNumericId(itemId);
 
-      let numericId;
-      if (typeof itemId === "number" || /^\d+$/.test(String(itemId))) {
-        numericId = parseInt(itemId, 10);
-      } else {
-        numericId = ITEM_STORE_IDS[itemId];
-        if (!numericId) {
-          return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
-        }
+      if (!numericId) {
+        return res.status(400).json({ success: false, message: `Unknown itemId: ${itemId}` });
       }
 
       console.log(`[Purchase] confirm-web-tx: txHash=${txHash} itemId=${numericId} wallet=${playerAddress} session=${sessionId}`);
 
-      // Wait for the transaction receipt
+      // ── Wait for receipt ──────────────────────────────────────────────────
       let receipt;
       try {
         receipt = await blockchainService.provider.waitForTransaction(txHash, 1, 60000);
@@ -734,7 +705,6 @@ router.post(
       }
 
       if (!receipt || receipt.status !== 1) {
-        // Record failed transaction
         try {
           const player = await Player.findOne({ walletAddress: playerAddress });
           if (player) {
@@ -770,7 +740,6 @@ router.post(
 
       console.log(`[Purchase] Web tx confirmed: ${txHash}, block: ${receipt.blockNumber}`);
 
-      // Verify on-chain ownership
       const hasItem = await blockchainService.hasPlayerBoughtItem(playerAddress, numericId);
       if (!hasItem) {
         return res.status(400).json({
@@ -784,16 +753,18 @@ router.post(
       const item = await blockchainService.getItem(numericId);
       const stringItemId = NUMERIC_TO_ITEM_ID[numericId] || `item_${numericId}`;
 
-      // Update MongoDB player inventory
+      // ── Update MongoDB inventory ──────────────────────────────────────────
       let playerUpdated = false;
       let playerId = null;
+      let playerDoc = null;
+
       try {
-        const player = await Player.findOne({ walletAddress: playerAddress });
-        if (player) {
-          playerId = player._id;
-          if (!player.ownedItems.includes(stringItemId)) {
-            player.ownedItems.push(stringItemId);
-            await player.save();
+        playerDoc = await Player.findOne({ walletAddress: playerAddress });
+        if (playerDoc) {
+          playerId = playerDoc._id;
+          if (!playerDoc.ownedItems.includes(stringItemId)) {
+            playerDoc.ownedItems.push(stringItemId);
+            await playerDoc.save();
             playerUpdated = true;
             console.log(`[Purchase] Updated inventory: ${playerAddress} → ${stringItemId}`);
           }
@@ -802,7 +773,7 @@ router.post(
         console.error(`[Purchase] Database update error:`, dbErr.message);
       }
 
-      // Record transaction in MongoDB
+      // ── Record transaction ────────────────────────────────────────────────
       if (playerId) {
         try {
           await transactionService.recordTransaction({
@@ -820,18 +791,21 @@ router.post(
             type: "purchase",
             metadata: { stringItemId, source: "web-app", sessionId },
           });
-
           await transactionService.confirmTransaction(txHash, {
             blockNumber: receipt.blockNumber,
             gasUsed: receipt.gasUsed?.toString(),
             gasPrice: receipt.gasPrice?.toString(),
           });
-
           console.log(`[Purchase] Web tx recorded: ${txHash}`);
         } catch (txErr) {
           console.error(`[Purchase] Failed to record transaction:`, txErr.message);
         }
       }
+
+      // ── Refresh + cache the post-purchase ETH balance ─────────────────────
+      // Fire-and-forget: we respond to the web app immediately but ensure
+      // the balance is written to MongoDB before Unity resumes in the foreground.
+      safeRefreshBalance(playerAddress);
 
       return res.json({
         success: true,
@@ -846,6 +820,7 @@ router.post(
         playerInventoryUpdated: playerUpdated,
         explorerUrl: `https://sepolia.etherscan.io/tx/${txHash}`,
       });
+
     } catch (err) {
       console.error("[Purchase] confirm-web-tx error:", err.message);
       return res.status(500).json({ success: false, message: err.message });
