@@ -179,8 +179,8 @@ PlayerSchema.methods.toPublicProfile = function () {
     cachedEthBalanceWei: this.cachedEthBalanceWei,
     ethBalanceFetchedAt: this.ethBalanceFetchedAt,
     // High score
-    bestTime: this.bestTime,
-    bestTimeMatchId: this.bestTimeMatchId,
+    bestTime: this.bestTime || 0,
+    bestTimeMatchId: this.bestTimeMatchId || "",
   };
 };
 

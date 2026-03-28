@@ -309,8 +309,8 @@ router.get("/highscores", authenticate, async (req, res) => {
 
     return res.json({
       success: true,
-      bestTime: player?.bestTime || null,
-      bestTimeMatchId: player?.bestTimeMatchId || null,
+      bestTime: player?.bestTime || 0,
+      bestTimeMatchId: player?.bestTimeMatchId || "",
       highscores,
     });
   } catch (err) {
