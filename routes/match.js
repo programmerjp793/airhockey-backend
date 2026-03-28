@@ -14,7 +14,7 @@ const jwt     = require("jsonwebtoken");
 const { body, validationResult } = require("express-validator");
 const { v4: uuidv4 } = require("uuid");
 
-const { Match }    = require("../models/Match");
+const Match        = require("../models/Match");
 const Player       = require("../models/Player");
 const authenticate = require("../middleware/authenticate");
 
