@@ -11,6 +11,13 @@
 //   4. After every successful purchase (routes/payment.js submit-tx / confirm-web-tx)
 //      the same refreshAndCacheBalance() helper is called so the post-purchase balance
 //      is persisted before Unity polls /wallet/balance.
+//
+// Cross-wallet owned-items strategy:
+//   A player account has a single ownedItems array in MongoDB that is the
+//   union of everything purchased by ANY wallet ever linked to that account.
+//   When /info syncs on-chain items for the current wallet, it MERGES them
+//   into ownedItems rather than replacing — so items bought by a previous
+//   wallet are never lost from the account's inventory.
 
 const express = require('express');
 const router = express.Router();
@@ -44,6 +51,41 @@ async function refreshAndCacheBalance(walletAddress, player) {
 
 // Export so payment.js can import it
 module.exports.refreshAndCacheBalance = refreshAndCacheBalance;
+
+// ─── Owned-items merge helper ─────────────────────────────────────────────────
+/**
+ * Merges `newItemIds` (string item IDs from on-chain) into the player's
+ * existing ownedItems array using a Set union.
+ *
+ * Items already in player.ownedItems (bought by any previous wallet on this
+ * account) are KEPT. New items from the current wallet are ADDED.
+ * The document is only saved when something actually changed.
+ *
+ * @param {object}   player      Mongoose Player document
+ * @param {string[]} newItemIds  String item IDs to merge in
+ * @returns {string[]} The merged array
+ */
+async function mergeOwnedItems(player, newItemIds = []) {
+  const existing = new Set(player.ownedItems || []);
+  let changed = false;
+
+  for (const id of newItemIds) {
+    if (!existing.has(id)) {
+      existing.add(id);
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    player.ownedItems = Array.from(existing);
+    await player.save();
+  }
+
+  return Array.from(existing);
+}
+
+// Export so store.js can reuse it
+module.exports.mergeOwnedItems = mergeOwnedItems;
 
 // ─── GET /wallet/balance ──────────────────────────────────────────────────────
 // Returns the native ETH balance for the authenticated player's linked wallet.
@@ -98,6 +140,10 @@ router.get('/balance', authenticate, async (req, res, next) => {
 // ─── GET /wallet/info ─────────────────────────────────────────────────────────
 // Returns full player profile: identity + live ETH balance + tier + owned items.
 // Same caching strategy as /balance — live fetch → persist → fallback to cache.
+//
+// FIX: On-chain ownedItemIds are now MERGED into player.ownedItems instead of
+// replacing them. This preserves items bought by any previous wallet on this
+// account when the player connects a different wallet.
 router.get('/info', authenticate, async (req, res, next) => {
   try {
     const player = await Player.findById(req.player.id);
@@ -121,11 +167,11 @@ router.get('/info', authenticate, async (req, res, next) => {
         tier = info.tier || 0;
         fromCache = false;
 
-        // Sync owned items array from on-chain source of truth
+        // FIX: MERGE on-chain items into ownedItems — never replace.
+        // Previously this was: ownedItems = info.ownedItemIds (replace)
+        // which wiped items bought by a previous wallet when a new wallet connected.
         if (info.ownedItemIds && info.ownedItemIds.length > 0) {
-          ownedItems = info.ownedItemIds;
-          player.ownedItems = ownedItems;
-          await player.save();
+          ownedItems = await mergeOwnedItems(player, info.ownedItemIds);
         }
       } catch (chainErr) {
         console.warn('[Wallet] /info live fetch failed, returning cache:', chainErr.message);

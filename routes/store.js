@@ -12,23 +12,28 @@
 //   GET /api/store/items - Get all items
 //   GET /api/store/items/available - Get available items
 //   GET /api/store/items/:itemId - Get single item
-//   GET /api/store/owned - Get authenticated player's owned items
+//   GET /api/store/owned - Get authenticated player's owned items (merged across all wallets)
 //   GET /api/store/player/:playerAddress/items - Get player's owned items
 //   GET /api/store/player/:playerAddress/items/:itemId/owns - Check if player owns item
+//
+// Cross-wallet owned-items:
+//   GET /store/owned returns the UNION of player.ownedItems (MongoDB, all wallets)
+//   and on-chain items for the current wallet, merged so items from previous
+//   wallets on the same account are never lost.
 
 const express = require('express');
 const router = express.Router();
 const authenticate = require('../middleware/authenticate');
 const blockchainService = require('../services/blockchainService');
 const transactionService = require('../services/transactionService');
+const Player = require('../models/Player');
+const { mergeOwnedItems } = require('./wallet');
 
 // ==================== ADMIN ENDPOINTS ====================
-// All admin endpoints require authentication
 
 // POST /api/store/items - Create new item
 router.post('/items', authenticate, async (req, res, next) => {
   try {
-    // Check if user is admin
     if (!req.player.isAdmin) {
       return res.status(403).json({ success: false, message: 'Admin access required' });
     }
@@ -38,14 +43,12 @@ router.post('/items', authenticate, async (req, res, next) => {
     if (!name) {
       return res.status(400).json({ success: false, message: 'Item name is required' });
     }
-
     if (priceETH === undefined || priceETH === null) {
       return res.status(400).json({ success: false, message: 'Price in ETH is required' });
     }
 
     const result = await blockchainService.createItem(name, priceETH, isAvailable);
 
-    // Record admin action in transactions DB (optional, for audit)
     try {
       await transactionService.recordTransaction({
         transactionHash: result.txHash,
@@ -60,10 +63,7 @@ router.post('/items', authenticate, async (req, res, next) => {
         contractAddress: process.env.SMART_STORE_ADDRESS,
         methodName: 'createItem',
         type: 'admin_action',
-        metadata: {
-          isAvailable,
-          name,
-        },
+        metadata: { isAvailable, name },
       });
     } catch (txErr) {
       console.warn('[Store] Admin action transaction record failed:', txErr.message);
@@ -116,10 +116,7 @@ router.put('/items/:itemId/price', authenticate, async (req, res, next) => {
         contractAddress: process.env.SMART_STORE_ADDRESS,
         methodName: 'setItemPrice',
         type: 'admin_action',
-        metadata: {
-          itemId: numericItemId,
-          priceETH,
-        },
+        metadata: { itemId: numericItemId, priceETH },
       });
     } catch (txErr) {
       console.warn('[Store] Admin action transaction record failed:', txErr.message);
@@ -167,10 +164,7 @@ router.put('/items/:itemId/availability', authenticate, async (req, res, next) =
         contractAddress: process.env.SMART_STORE_ADDRESS,
         methodName: 'toggleItemAvailability',
         type: 'admin_action',
-        metadata: {
-          itemId: numericItemId,
-          available: result.isAvailable,
-        },
+        metadata: { itemId: numericItemId, available: result.isAvailable },
       });
     } catch (txErr) {
       console.warn('[Store] Admin action transaction record failed:', txErr.message);
@@ -207,7 +201,6 @@ router.put('/items/:itemId', authenticate, async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'At least one field to update is required' });
     }
 
-    // Get current item to preserve values
     let currentItem;
     try {
       currentItem = await blockchainService.getItem(numericItemId);
@@ -236,9 +229,7 @@ router.put('/items/:itemId', authenticate, async (req, res, next) => {
         contractAddress: process.env.SMART_STORE_ADDRESS,
         methodName: 'updateItem',
         type: 'admin_action',
-        metadata: {
-          isAvailable: isAvailable !== undefined ? isAvailable : currentItem.isAvailable,
-        },
+        metadata: { isAvailable: isAvailable !== undefined ? isAvailable : currentItem.isAvailable },
       });
     } catch (txErr) {
       console.warn('[Store] Admin action transaction record failed:', txErr.message);
@@ -264,7 +255,6 @@ router.post('/treasury', authenticate, async (req, res, next) => {
     }
 
     const { treasuryAddress } = req.body;
-
     if (!treasuryAddress) {
       return res.status(400).json({ success: false, message: 'Treasury address is required' });
     }
@@ -285,9 +275,7 @@ router.post('/treasury', authenticate, async (req, res, next) => {
         contractAddress: process.env.SMART_STORE_ADDRESS,
         methodName: 'setTreasury',
         type: 'admin_action',
-        metadata: {
-          treasuryAddress,
-        },
+        metadata: { treasuryAddress },
       });
     } catch (txErr) {
       console.warn('[Store] Admin action transaction record failed:', txErr.message);
@@ -306,19 +294,12 @@ router.post('/treasury', authenticate, async (req, res, next) => {
 });
 
 // ==================== PLAYER/PUBLIC ENDPOINTS ====================
-// These endpoints are public (no auth required)
 
 // GET /api/store/items - Get all items
 router.get('/items', async (req, res, next) => {
   try {
     const items = await blockchainService.getStoreItems();
-
-    return res.json({
-      success: true,
-      count: items.length,
-      items,
-    });
-
+    return res.json({ success: true, count: items.length, items });
   } catch (err) {
     console.error('[Store] GET /items error:', err.message);
     next(err);
@@ -329,13 +310,7 @@ router.get('/items', async (req, res, next) => {
 router.get('/items/available', async (req, res, next) => {
   try {
     const items = await blockchainService.getAvailableStoreItems();
-
-    return res.json({
-      success: true,
-      count: items.length,
-      items,
-    });
-
+    return res.json({ success: true, count: items.length, items });
   } catch (err) {
     console.error('[Store] GET /items/available error:', err.message);
     next(err);
@@ -346,20 +321,15 @@ router.get('/items/available', async (req, res, next) => {
 router.get('/items/:itemId', async (req, res, next) => {
   try {
     const { itemId } = req.params;
-
-    // Try to parse as numeric ID
     const numericId = parseInt(itemId, 10);
-    
+
     let item;
     if (!isNaN(numericId) && numericId > 0) {
       try {
         item = await blockchainService.getItem(numericId);
-      } catch (e) {
-        // Item not found
-      }
+      } catch (e) { /* not found by numeric id */ }
     }
 
-    // If not found by numeric ID, try to find in all items
     if (!item) {
       const items = await blockchainService.getStoreItems();
       item = items.find(i => i.itemId === itemId || i.itemIdStr === itemId);
@@ -377,50 +347,90 @@ router.get('/items/:itemId', async (req, res, next) => {
   }
 });
 
-// GET /api/store/items/available - Get available items only (must be AFTER /items/:itemId to avoid conflict)
-
-// GET /api/store/owned - Get authenticated player's owned items (for StoreManager.cs line 439)
+// GET /api/store/owned
+// Returns the MERGED list of items owned by the player across ALL wallets.
+//
+// FIX: Previously this called blockchainService.getPlayerItems(walletAddress)
+// directly and returned only what the current wallet owns on-chain. That caused
+// items purchased by a previous wallet to disappear when the player switched
+// wallets.
+//
+// Now:
+//   1. Load player.ownedItems from MongoDB (account-level truth, all wallets).
+//   2. Fetch on-chain items for the current wallet.
+//   3. MERGE the two sets — never replace — and persist the result.
+//   4. Return the merged list.
 router.get('/owned', async (req, res, next) => {
   try {
     let playerAddress = null;
+    let playerDoc = null;
 
-    // Try to get player from auth header
+    // Try to resolve the authenticated player document
     if (req.headers.authorization) {
       try {
         const authService = require('../services/unityAuthService');
-        const player = await authService.verifyToken(req.headers.authorization.replace("Bearer ", ""));
+        const player = await authService.verifyToken(
+          req.headers.authorization.replace('Bearer ', '')
+        );
         if (player) {
-          playerAddress = player.walletAddress;
+          playerDoc = await Player.findById(player._id || player.id);
+          playerAddress = playerDoc?.walletAddress;
         }
-      } catch (e) {
-        // Auth failed, continue
-      }
+      } catch (e) { /* auth failed — continue to query param fallback */ }
     }
 
-    // If still no player address, try query param or header
-    if (!playerAddress) {
-      playerAddress = req.query.walletAddress || req.headers['x-wallet-address'];
+    // Fallback: wallet address from query param or header
+    const queryWallet = (
+      req.query.walletAddress ||
+      req.headers['x-wallet-address']
+    )?.toLowerCase();
+
+    if (queryWallet && !playerDoc) {
+      // Try to find the player document by this wallet address so we can
+      // read and merge ownedItems from MongoDB
+      playerDoc = await Player.findOne({ walletAddress: queryWallet });
     }
 
+    playerAddress = playerAddress || queryWallet;
+
     if (!playerAddress) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Wallet address is required. Provide via auth token, query param (walletAddress), or header (x-wallet-address)' 
+      return res.status(400).json({
+        success: false,
+        message: 'Wallet address is required. Provide via auth token, query param (walletAddress), or header (x-wallet-address)',
       });
     }
 
     playerAddress = playerAddress.toLowerCase();
     console.log(`[Store] GET /owned for wallet: ${playerAddress}`);
 
-    const ownedItems = await blockchainService.getPlayerItems(playerAddress);
+    // Start with MongoDB ownedItems — preserves all previous wallet purchases
+    let ownedItemIds = playerDoc?.ownedItems || [];
 
-    // Convert to string array for response
-    const ownedItemIds = ownedItems.map(item => item.itemIdStr || item.itemId?.toString());
+    // Fetch what this wallet currently owns on-chain and merge in
+    try {
+      const onChainItems = await blockchainService.getPlayerItems(playerAddress);
+      const onChainIds = onChainItems.map(item => item.itemIdStr || item.itemId?.toString());
+
+      if (playerDoc) {
+        // Persist the merge so future requests have the full list in MongoDB
+        ownedItemIds = await mergeOwnedItems(playerDoc, onChainIds);
+      } else {
+        // No player document found — return union without persisting
+        const merged = new Set([...ownedItemIds, ...onChainIds]);
+        ownedItemIds = Array.from(merged);
+      }
+
+      console.log(`[Store] /owned onChain=${onChainIds.length} merged total=${ownedItemIds.length}`);
+    } catch (chainErr) {
+      // Non-fatal — return MongoDB snapshot if on-chain call fails
+      console.warn('[Store] /owned on-chain fetch failed, returning MongoDB snapshot:', chainErr.message);
+    }
 
     return res.json({
       success: true,
       ownedItems: ownedItemIds,
       count: ownedItemIds.length,
+      walletAddress: playerAddress,
     });
 
   } catch (err) {
@@ -429,7 +439,7 @@ router.get('/owned', async (req, res, next) => {
   }
 });
 
-// GET /api/store/player/:playerAddress/items - Get player's owned items
+// GET /api/store/player/:playerAddress/items - Get player's owned items (on-chain only)
 router.get('/player/:playerAddress/items', async (req, res, next) => {
   try {
     const { playerAddress } = req.params;
@@ -453,7 +463,7 @@ router.get('/player/:playerAddress/items', async (req, res, next) => {
   }
 });
 
-// GET /api/store/player/:playerAddress/items/:itemId/owns - Check if player owns item
+// GET /api/store/player/:playerAddress/items/:itemId/owns - Check if player owns item (on-chain)
 router.get('/player/:playerAddress/items/:itemId/owns', async (req, res, next) => {
   try {
     const { playerAddress, itemId } = req.params;
