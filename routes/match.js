@@ -175,6 +175,17 @@ router.post(
         },
       });
 
+      // ─── Personal Best Time ─────────────────────────────────────────────────
+      if (winner === "player") {
+        const playerDoc = await Player.findById(req.player._id);
+        if (playerDoc.bestTime === null || playerDoc.bestTime === undefined || durationSecs < playerDoc.bestTime) {
+          playerDoc.bestTime = durationSecs;
+          playerDoc.bestTimeMatchId = matchId;
+          await playerDoc.save();
+          console.log(`[Match] New personal best: ${durationSecs}s for player ${req.player._id}`);
+        }
+      }
+
       return res.json({
         success:   true,
         validated: true,
@@ -234,6 +245,17 @@ router.post("/save", authenticate, async (req, res) => {
 
     await Player.findByIdAndUpdate(player._id, statsUpdate);
 
+    // ─── Personal Best Time ─────────────────────────────────────────────────
+    if (winner === "player" && durationSeconds > 0) {
+      const playerDoc = await Player.findById(player._id);
+      if (playerDoc.bestTime === null || playerDoc.bestTime === undefined || durationSeconds < playerDoc.bestTime) {
+        playerDoc.bestTime = durationSeconds;
+        playerDoc.bestTimeMatchId = matchId;
+        await playerDoc.save();
+        console.log(`[Match] New personal best: ${durationSeconds}s for player ${player._id}`);
+      }
+    }
+
     return res.json({ success: true, matchId: match.matchId, message: "Match saved" });
   } catch (err) {
     console.error("[Match] Save error:", err);
@@ -254,6 +276,46 @@ router.get("/history", authenticate, async (req, res) => {
     return res.json({ success: true, matches });
   } catch (err) {
     return res.status(500).json({ success: false, message: "Failed to fetch history" });
+  }
+});
+/**
+ * GET /api/match/highscores
+ * Returns the player's top 10 personal best wins sorted by fastest time.
+ */
+router.get("/highscores", authenticate, async (req, res) => {
+  try {
+    const matches = await Match.find({
+      playerId: req.player._id,
+      winner: "player",
+      status: { $in: ["completed", "rewarded", "validated"] },
+      durationSecs: { $gt: 0 },
+    })
+      .select("matchId playerScore aiScore opponentScore durationSecs startedAt difficulty")
+      .sort({ durationSecs: 1 })   // fastest first
+      .limit(10);
+
+    const highscores = matches.map((m, i) => ({
+      rank: i + 1,
+      matchId: m.matchId,
+      difficulty: m.difficulty || m.aiProfile?.difficulty || "medium",
+      playerScore: m.playerScore,
+      opponentScore: m.aiScore || m.opponentScore || 0,
+      durationSecs: m.durationSecs,
+      startedAt: m.startedAt,
+    }));
+
+    // Include personal best from player profile
+    const player = await Player.findById(req.player._id).select("bestTime bestTimeMatchId");
+
+    return res.json({
+      success: true,
+      bestTime: player?.bestTime || null,
+      bestTimeMatchId: player?.bestTimeMatchId || null,
+      highscores,
+    });
+  } catch (err) {
+    console.error("[Match] Highscores error:", err);
+    return res.status(500).json({ success: false, message: "Failed to fetch highscores" });
   }
 });
 

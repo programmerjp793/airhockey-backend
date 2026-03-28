@@ -108,6 +108,17 @@ const PlayerSchema = new mongoose.Schema({
     default: false,
   },
 
+  // ─── High Score ──────────────────────────────────────────────────────────────
+  bestTime: {
+    type: Number,
+    default: null,         // fastest win duration in seconds (null = no wins yet)
+  },
+
+  bestTimeMatchId: {
+    type: String,
+    default: null,         // matchId where the best time was achieved
+  },
+
   // ─── Metadata ─────────────────────────────────────────────────────────────
   lastSeenAt: {
     type: Date,
@@ -167,6 +178,9 @@ PlayerSchema.methods.toPublicProfile = function () {
     cachedEthBalance: this.cachedEthBalance,
     cachedEthBalanceWei: this.cachedEthBalanceWei,
     ethBalanceFetchedAt: this.ethBalanceFetchedAt,
+    // High score
+    bestTime: this.bestTime,
+    bestTimeMatchId: this.bestTimeMatchId,
   };
 };
 
